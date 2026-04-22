@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi-lsp-bridge.dev/schemas/repo-config.schema.json",
+  "title": "pi-lsp-bridge repo config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "autoDetect": {
+      "type": "boolean",
+      "default": true
+    },
+    "debug": {
+      "type": "boolean",
+      "default": false
+    },
+    "excludePaths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "lspDebounceMs": { "type": "integer", "minimum": 0 },
+        "cliDebounceMs": { "type": "integer", "minimum": 0 },
+        "cliWorkspaceDebounceMs": { "type": "integer", "minimum": 0 },
+        "injectCooldownMs": { "type": "integer", "minimum": 0 },
+        "idleSuspendMs": { "type": "integer", "minimum": 0 },
+        "triggerCooldownMs": { "type": "integer", "minimum": 0 },
+        "maxOpenDocuments": { "type": "integer", "minimum": 1 },
+        "maxFileBytes": { "type": "integer", "minimum": 1024 },
+        "bootstrapSampleFiles": { "type": "integer", "minimum": 0 },
+        "orphanSweepMaxAgeMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "required": ["id"],
+            "additionalProperties": true,
+            "properties": {
+              "id": { "type": "string" },
+              "disabled": { "type": "boolean" },
+              "kind": { "enum": ["lsp", "cli"] },
+              "command": { "type": "string" },
+              "args": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        ]
+      },
+      "default": []
+    }
+  }
+}
