@@ -4,11 +4,184 @@ import { loadConfig, selectProviders } from "./config.js";
 import { buildFileSummary, buildPromptSummary, DiagnosticsStore, formatCounts } from "./diagnostics.js";
 import { CliProvider } from "./provider-cli.js";
 import { LspProvider } from "./provider-lsp.js";
-import type { BridgeLifecycleConfig, ProviderRuntime, ProviderSpec, TriggerReason } from "./types.js";
+import type {
+	BridgeLifecycleConfig,
+	ProviderRuntime,
+	ProviderSpec,
+	ProviderStatus,
+	StatusSymbolsMode,
+	TriggerReason,
+} from "./types.js";
 import { findWorkspaceRoot, now, scanWorkspace, toRelative } from "./util.js";
 
 const GLOBAL_HANDLERS = new Set<string>();
 let PROCESS_CLEANUP: (() => Promise<void>) | undefined;
+
+const NF_ICON_DEFAULT = "\ue64e";
+const NF_ICON_CONFIG = "\ue615";
+const NF_ICON_JAVASCRIPT = "\ue60c";
+const NF_ICON_TYPESCRIPT = "\ue628";
+const NF_ICON_ESLINT = "\ue7d2";
+const NF_ICON_GO = "\ue627";
+const NF_ICON_RUST = "\ue68b";
+const NF_ICON_PYTHON = "\ue606";
+const NF_ICON_CPP = "\ue646";
+const NF_ICON_YAML = "\ue6a8";
+const NF_ICON_JSON = "\ue60b";
+const NF_ICON_SHELL = "\ue691";
+const NF_ICON_HTML = "\ue60e";
+const NF_ICON_CSS = "\ue614";
+const NF_ICON_MARKDOWN = "\ue609";
+
+const NF_STATE_STARTING = "\ueb19";
+const NF_STATE_RUNNING = "\ueb2c";
+const NF_STATE_STOPPED = "\ueba5";
+const NF_STATE_COOLDOWN = "\uead1";
+const NF_STATE_BACKOFF = "\uea77";
+const NF_STATE_MISSING = "\uea6c";
+const NF_STATE_DISABLED = "\ueabd";
+
+const PROVIDER_ICON_BY_ID: Record<string, string> = {
+	"typescript-language-server": NF_ICON_TYPESCRIPT,
+	eslint: NF_ICON_ESLINT,
+	gopls: NF_ICON_GO,
+	"golangci-lint": NF_ICON_GO,
+	"rust-analyzer": NF_ICON_RUST,
+	pyright: NF_ICON_PYTHON,
+	ruff: NF_ICON_PYTHON,
+	clangd: NF_ICON_CPP,
+	"yaml-language-server": NF_ICON_YAML,
+	"json-language-server": NF_ICON_JSON,
+	"bash-language-server": NF_ICON_SHELL,
+	"html-language-server": NF_ICON_HTML,
+	"css-language-server": NF_ICON_CSS,
+	marksman: NF_ICON_MARKDOWN,
+};
+
+const PROVIDER_LABEL_BY_ID: Record<string, string> = {
+	"typescript-language-server": "ts",
+	eslint: "eslint",
+	gopls: "go",
+	"golangci-lint": "golint",
+	"rust-analyzer": "rust",
+	pyright: "py",
+	ruff: "ruff",
+	clangd: "cpp",
+	"yaml-language-server": "yml",
+	"json-language-server": "json",
+	"bash-language-server": "sh",
+	"html-language-server": "html",
+	"css-language-server": "css",
+	marksman: "md",
+};
+
+const PROVIDER_ICON_BY_FAMILY: Record<string, string> = {
+	"javascript-typescript": NF_ICON_JAVASCRIPT,
+	go: NF_ICON_GO,
+	rust: NF_ICON_RUST,
+	python: NF_ICON_PYTHON,
+	"c-cpp": NF_ICON_CPP,
+	yaml: NF_ICON_YAML,
+	json: NF_ICON_JSON,
+	shell: NF_ICON_SHELL,
+	html: NF_ICON_HTML,
+	css: NF_ICON_CSS,
+	markdown: NF_ICON_MARKDOWN,
+};
+
+const PROVIDER_LABEL_BY_FAMILY: Record<string, string> = {
+	"javascript-typescript": "js",
+	go: "go",
+	rust: "rust",
+	python: "py",
+	"c-cpp": "cpp",
+	yaml: "yml",
+	json: "json",
+	shell: "sh",
+	html: "html",
+	css: "css",
+	markdown: "md",
+};
+
+const STATE_ICON_BY_STATUS: Record<ProviderStatus["state"], string> = {
+	stopped: NF_STATE_STOPPED,
+	starting: NF_STATE_STARTING,
+	running: NF_STATE_RUNNING,
+	cooldown: NF_STATE_COOLDOWN,
+	backoff: NF_STATE_BACKOFF,
+	missing: NF_STATE_MISSING,
+	disabled: NF_STATE_DISABLED,
+};
+
+const STATE_LABEL_BY_STATUS: Record<ProviderStatus["state"], string> = {
+	stopped: "stopped",
+	starting: "starting",
+	running: "running",
+	cooldown: "cooldown",
+	backoff: "backoff",
+	missing: "missing",
+	disabled: "disabled",
+};
+
+function inferProviderIcon(id: string): string | undefined {
+	const normalized = id.toLowerCase();
+	if (normalized.includes("eslint")) return NF_ICON_ESLINT;
+	if (normalized.includes("typescript") || normalized.includes("tsserver") || normalized.includes("vtsls")) return NF_ICON_TYPESCRIPT;
+	if (normalized.includes("javascript")) return NF_ICON_JAVASCRIPT;
+	if (normalized.includes("golangci") || normalized.includes("gopls") || normalized.includes("go")) return NF_ICON_GO;
+	if (normalized.includes("rust")) return NF_ICON_RUST;
+	if (normalized.includes("python") || normalized.includes("pyright") || normalized.includes("pylsp") || normalized.includes("ruff")) return NF_ICON_PYTHON;
+	if (normalized.includes("clang") || normalized.includes("cpp") || normalized.includes("c++")) return NF_ICON_CPP;
+	if (normalized.includes("yaml") || normalized.includes("yml")) return NF_ICON_YAML;
+	if (normalized.includes("json")) return NF_ICON_JSON;
+	if (normalized.includes("bash") || normalized.includes("shell")) return NF_ICON_SHELL;
+	if (normalized.includes("html")) return NF_ICON_HTML;
+	if (normalized.includes("css")) return NF_ICON_CSS;
+	if (normalized.includes("markdown") || normalized.includes("marksman")) return NF_ICON_MARKDOWN;
+	return undefined;
+}
+
+function inferProviderLabel(id: string): string {
+	const normalized = id.toLowerCase();
+	if (normalized.includes("eslint")) return "eslint";
+	if (normalized.includes("typescript") || normalized.includes("tsserver") || normalized.includes("vtsls")) return "ts";
+	if (normalized.includes("javascript")) return "js";
+	if (normalized.includes("golangci")) return "golint";
+	if (normalized.includes("gopls") || normalized.includes("go")) return "go";
+	if (normalized.includes("rust")) return "rust";
+	if (normalized.includes("python") || normalized.includes("pyright") || normalized.includes("pylsp")) return "py";
+	if (normalized.includes("ruff")) return "ruff";
+	if (normalized.includes("clang") || normalized.includes("cpp") || normalized.includes("c++")) return "cpp";
+	if (normalized.includes("yaml") || normalized.includes("yml")) return "yml";
+	if (normalized.includes("json")) return "json";
+	if (normalized.includes("bash") || normalized.includes("shell")) return "sh";
+	if (normalized.includes("html")) return "html";
+	if (normalized.includes("css")) return "css";
+	if (normalized.includes("markdown") || normalized.includes("marksman")) return "md";
+	return normalized
+		.replace(/-language-server$/u, "")
+		.replace(/-langserver$/u, "")
+		.replace(/-analyzer$/u, "")
+		.replace(/[^a-z0-9+]+/gu, "-");
+}
+
+function providerStatusIcon(spec: ProviderSpec): string {
+	return (
+		PROVIDER_ICON_BY_ID[spec.id] ??
+		(spec.family ? PROVIDER_ICON_BY_FAMILY[spec.family] : undefined) ??
+		inferProviderIcon(spec.id) ??
+		(spec.kind === "cli" ? NF_ICON_CONFIG : NF_ICON_DEFAULT)
+	);
+}
+
+function providerStatusLabel(spec: ProviderSpec): string {
+	return PROVIDER_LABEL_BY_ID[spec.id] ?? (spec.family ? PROVIDER_LABEL_BY_FAMILY[spec.family] : undefined) ?? inferProviderLabel(spec.id);
+}
+
+function formatProviderStatus(spec: ProviderSpec, status: ProviderStatus, symbols: StatusSymbolsMode): string {
+	if (symbols === "text") return `${providerStatusLabel(spec)}:${STATE_LABEL_BY_STATUS[status.state]}`;
+	return `${providerStatusIcon(spec)} ${STATE_ICON_BY_STATUS[status.state]}`;
+}
 
 function discoveryRelevantFile(path: string): boolean {
 	const name = path.split("/").pop() ?? path;
@@ -36,9 +209,11 @@ export class WorkspaceBridge {
 	private lifecycle: BridgeLifecycleConfig;
 	private cleanupRegistry: CleanupRegistry;
 	private providers: ProviderRuntime[] = [];
+	private readonly listeners = new Set<() => void>();
 	private inventory = scanWorkspace(process.cwd());
 	private excludePaths: string[] = [];
 	private debug = false;
+	private statusSymbols: StatusSymbolsMode = "nerdfont";
 	private idleTimer: NodeJS.Timeout | undefined;
 	private lastInjectionDigest = "";
 	private lastInjectionAt = 0;
@@ -57,6 +232,7 @@ export class WorkspaceBridge {
 		const bridge = new WorkspaceBridge(workspaceRoot, loaded.lifecycle, cleanupRegistry);
 		bridge.debug = loaded.debug;
 		bridge.excludePaths = loaded.repoConfig.excludePaths ?? [];
+		bridge.statusSymbols = loaded.status.symbols;
 		bridge.rediscover();
 		bridge.touchActivity();
 		bridge.installProcessHandlers();
@@ -95,8 +271,16 @@ export class WorkspaceBridge {
 
 	private buildProviders(specs: ProviderSpec[]): ProviderRuntime[] {
 		return specs.map((spec) => {
-			if (spec.kind === "cli") return new CliProvider(spec, this.workspaceRoot, this.store, this.lifecycle);
-			return new LspProvider(spec, this.workspaceRoot, this.inventory.files, this.store, this.lifecycle, this.cleanupRegistry);
+			if (spec.kind === "cli") return new CliProvider(spec, this.workspaceRoot, this.store, this.lifecycle, () => this.emitChange());
+			return new LspProvider(
+				spec,
+				this.workspaceRoot,
+				this.inventory.files,
+				this.store,
+				this.lifecycle,
+				this.cleanupRegistry,
+				() => this.emitChange(),
+			);
 		});
 	}
 
@@ -105,6 +289,7 @@ export class WorkspaceBridge {
 		this.lifecycle = loaded.lifecycle;
 		this.debug = loaded.debug;
 		this.excludePaths = loaded.repoConfig.excludePaths ?? [];
+		this.statusSymbols = loaded.status.symbols;
 		this.inventory = scanWorkspace(this.workspaceRoot, this.excludePaths);
 		const specs = selectProviders(this.inventory, loaded);
 		const nextProviders = this.buildProviders(specs);
@@ -114,6 +299,7 @@ export class WorkspaceBridge {
 	private async replaceProviders(nextProviders: ProviderRuntime[]): Promise<void> {
 		const previous = this.providers;
 		this.providers = nextProviders;
+		this.emitChange();
 		for (const provider of previous) {
 			await provider.suspend("reload");
 		}
@@ -125,6 +311,17 @@ export class WorkspaceBridge {
 	private scheduleRediscover(): void {
 		if (this.rediscoverTimer) clearTimeout(this.rediscoverTimer);
 		this.rediscoverTimer = setTimeout(() => this.rediscover(), 2_000);
+	}
+
+	subscribe(listener: () => void): () => void {
+		this.listeners.add(listener);
+		return () => {
+			this.listeners.delete(listener);
+		};
+	}
+
+	private emitChange(): void {
+		for (const listener of this.listeners) listener();
 	}
 
 	touchActivity(): void {
@@ -187,8 +384,10 @@ export class WorkspaceBridge {
 	statusText(): string {
 		const counts = formatCounts(this.store.getCounts());
 		const providerText = this.providers
-			.map((provider) => `${provider.spec.id}:${provider.getStatus().state}`)
-			.join(" ");
+			.map((provider) => ({ provider, status: provider.getStatus() }))
+			.filter(({ status }) => status.state === "starting" || status.state === "running" || status.state === "cooldown")
+			.map(({ provider, status }) => formatProviderStatus(provider.spec, status, this.statusSymbols))
+			.join(" · ");
 		return `lsp-bridge ${counts}${providerText ? ` | ${providerText}` : ""}`;
 	}
 

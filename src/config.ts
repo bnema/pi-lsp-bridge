@@ -6,6 +6,7 @@ import type {
 	ProviderOverride,
 	ProviderSpec,
 	RepoConfig,
+	StatusSymbolsMode,
 	WorkspaceInventory,
 } from "./types.js";
 import { readJsonFile } from "./util.js";
@@ -22,6 +23,28 @@ export const DEFAULT_LIFECYCLE: BridgeLifecycleConfig = {
 	bootstrapSampleFiles: 5,
 	orphanSweepMaxAgeMs: 24 * 60 * 60_000,
 };
+
+function normalizeStatusSymbols(value: string | undefined): StatusSymbolsMode | undefined {
+	switch (value?.trim().toLowerCase()) {
+		case "nerdfont":
+		case "nf":
+		case "icon":
+		case "icons":
+		case "on":
+		case "true":
+		case "1":
+			return "nerdfont";
+		case "text":
+		case "plain":
+		case "ascii":
+		case "off":
+		case "false":
+		case "0":
+			return "text";
+		default:
+			return undefined;
+	}
+}
 
 function mergeProviderSpec(base: ProviderSpec, override: ProviderOverride): ProviderSpec {
 	const commandCandidates = override.command
@@ -66,11 +89,18 @@ export function loadConfig(workspaceRoot: string): LoadedConfig {
 		...(repoConfig.lifecycle ?? {}),
 	};
 	const opencode = opencodeOverrides(workspaceRoot);
+	const status = {
+		symbols:
+			normalizeStatusSymbols(process.env.PI_LSP_BRIDGE_STATUS_SYMBOLS) ??
+			normalizeStatusSymbols(repoConfig.status?.symbols) ??
+			"nerdfont",
+	} as const;
 	return {
 		repoConfig,
 		opencodeOverrides: opencode,
 		lifecycle,
 		debug: repoConfig.debug === true,
+		status,
 	};
 }
 

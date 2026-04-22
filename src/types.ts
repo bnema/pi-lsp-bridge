@@ -76,12 +76,19 @@ export interface BridgeLifecycleConfig {
 	orphanSweepMaxAgeMs: number;
 }
 
+export type StatusSymbolsMode = "nerdfont" | "text";
+
+export interface StatusConfig {
+	symbols?: StatusSymbolsMode;
+}
+
 export interface RepoConfig {
 	autoDetect?: boolean;
 	debug?: boolean;
 	excludePaths?: string[];
 	lifecycle?: Partial<BridgeLifecycleConfig>;
 	providers?: Array<string | ProviderOverride>;
+	status?: StatusConfig;
 }
 
 export interface LoadedConfig {
@@ -89,6 +96,7 @@ export interface LoadedConfig {
 	opencodeOverrides: ProviderOverride[];
 	lifecycle: BridgeLifecycleConfig;
 	debug: boolean;
+	status: Required<StatusConfig>;
 }
 
 export interface WorkspaceInventory {

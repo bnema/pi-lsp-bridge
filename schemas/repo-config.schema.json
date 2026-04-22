@@ -34,6 +34,16 @@
         "orphanSweepMaxAgeMs": { "type": "integer", "minimum": 0 }
       }
     },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "symbols": {
+          "enum": ["nerdfont", "text"],
+          "default": "nerdfont"
+        }
+      }
+    },
     "providers": {
       "type": "array",
       "items": {

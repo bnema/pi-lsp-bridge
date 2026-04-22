@@ -15,32 +15,52 @@ function extractToolPaths(input: unknown, cwd: string): string[] {
 	return [normalized.startsWith("/") ? normalized : `${cwd}/${normalized}`];
 }
 
-function applyStatus(bridge: WorkspaceBridge | undefined, ctx: { hasUI: boolean; ui: { setStatus: (key: string, value: string | undefined) => void } }): void {
+type StatusContext = { hasUI: boolean; ui: { setStatus: (key: string, value: string | undefined) => void } };
+
+function applyStatus(bridge: WorkspaceBridge | undefined, ctx: StatusContext): void {
 	if (!bridge || !ctx.hasUI) return;
 	ctx.ui.setStatus("pi-lsp-bridge", bridge.statusText());
 }
 
 export default function (pi: ExtensionAPI) {
 	let bridge: WorkspaceBridge | undefined;
+	let latestStatusContext: StatusContext | undefined;
+	let unsubscribeStatus: (() => void) | undefined;
 
-	function ensureBridge(cwd: string): WorkspaceBridge {
+	function bindStatus(current: WorkspaceBridge, ctx: StatusContext): void {
+		latestStatusContext = ctx;
+		if (bridge !== current || !unsubscribeStatus) {
+			unsubscribeStatus?.();
+			unsubscribeStatus = current.subscribe(() => {
+				if (latestStatusContext) applyStatus(current, latestStatusContext);
+			});
+		}
+		applyStatus(current, ctx);
+	}
+
+	function ensureBridge(cwd: string, ctx?: StatusContext): WorkspaceBridge {
 		const workspaceRoot = findWorkspaceRoot(cwd);
 		if (!bridge || bridge.workspaceRoot !== workspaceRoot) {
+			unsubscribeStatus?.();
+			unsubscribeStatus = undefined;
 			bridge = WorkspaceBridge.create(workspaceRoot);
 		}
+		if (ctx) bindStatus(bridge, ctx);
 		return bridge;
 	}
 
 	async function restartBridge(ctx: ExtensionCommandContext): Promise<void> {
 		if (bridge) await bridge.shutdown("reload");
+		unsubscribeStatus?.();
+		unsubscribeStatus = undefined;
 		bridge = WorkspaceBridge.create(findWorkspaceRoot(ctx.cwd));
-		applyStatus(bridge, ctx);
+		bindStatus(bridge, ctx);
 	}
 
 	pi.registerCommand("lsp-status", {
 		description: "Show current background diagnostics bridge status",
 		handler: async (_args, ctx) => {
-			const current = ensureBridge(ctx.cwd);
+			const current = ensureBridge(ctx.cwd, ctx);
 			ctx.ui.notify(current.statusText(), "info");
 		},
 	});
@@ -67,7 +87,7 @@ export default function (pi: ExtensionAPI) {
 			maxItems: Type.Optional(Type.Number({ description: "Maximum diagnostics to show", minimum: 1, maximum: 100 })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const current = ensureBridge(ctx.cwd);
+			const current = ensureBridge(ctx.cwd, ctx);
 			const text = current.diagnosticsText({
 				path: params.path,
 				providerId: params.providerId,
@@ -83,13 +103,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		bridge = WorkspaceBridge.create(findWorkspaceRoot(ctx.cwd));
-		applyStatus(bridge, ctx);
+		bindStatus(bridge, ctx);
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		const current = ensureBridge(ctx.cwd);
+		const current = ensureBridge(ctx.cwd, ctx);
 		const summary = current.buildPromptContext();
-		applyStatus(current, ctx);
 		if (!summary) return;
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${summary}\n\nUse the diagnostics tool if you need a fuller, current snapshot.`,
@@ -98,7 +117,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_result" as any, async (event: any, ctx: any) => {
 		if (!["read", "edit", "write"].includes(event.toolName) || event.isError) return;
-		const current = ensureBridge(ctx.cwd);
+		const current = ensureBridge(ctx.cwd, ctx);
 		const paths = extractToolPaths(event.input, ctx.cwd);
 		if (paths.length === 0) return;
 		const summary = await current.handleTouchedFiles(paths, event.toolName as "read" | "edit" | "write");
@@ -113,6 +132,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		unsubscribeStatus?.();
+		unsubscribeStatus = undefined;
+		latestStatusContext = undefined;
 		if (bridge) {
 			await bridge.shutdown("shutdown");
 			bridge = undefined;

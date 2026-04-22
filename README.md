@@ -16,7 +16,33 @@ It keeps background diagnostics available to the main agent without baking langu
 
 ## Install in pi
 
-From this directory during development:
+Install from GitHub:
+
+```bash
+pi install https://github.com/bnema/pi-lsp-bridge
+```
+
+Update an existing install:
+
+```bash
+pi update https://github.com/bnema/pi-lsp-bridge
+```
+
+Remove an existing install:
+
+```bash
+pi remove https://github.com/bnema/pi-lsp-bridge
+```
+
+Try it for one session without installing:
+
+```bash
+pi -e https://github.com/bnema/pi-lsp-bridge
+```
+
+## Local development
+
+From this directory:
 
 ```bash
 npm install
@@ -54,6 +80,9 @@ Example:
 {
   "$schema": "./node_modules/pi-lsp-bridge/schemas/repo-config.schema.json",
   "autoDetect": true,
+  "status": {
+    "symbols": "nerdfont"
+  },
   "lifecycle": {
     "idleSuspendMs": 600000,
     "injectCooldownMs": 10000
@@ -69,6 +98,16 @@ Example:
   ]
 }
 ```
+
+Set `"status": { "symbols": "text" }` to use compact plain-text labels instead of Nerd Font glyphs.
+
+You can also override it per session with:
+
+```bash
+PI_LSP_BRIDGE_STATUS_SYMBOLS=text pi -e .
+```
+
+The status bar only shows active providers (`starting`, `running`, `cooldown`). Inactive ones such as missing, stopped, backoff, or disabled are hidden.
 
 ## OpenCode compatibility
 

@@ -25,6 +25,7 @@ export class CliProvider implements ProviderRuntime {
 	private readonly store: DiagnosticsStore;
 	private readonly workspaceRoot: string;
 	private readonly lifecycle: BridgeLifecycleConfig;
+	private readonly onChange: () => void;
 	private status: ProviderStatus = { state: "stopped" };
 	private timer: NodeJS.Timeout | undefined;
 	private inflight = false;
@@ -33,15 +34,30 @@ export class CliProvider implements ProviderRuntime {
 	private pendingResolvers: Array<() => void> = [];
 	private backoffUntil = 0;
 
-	constructor(spec: ProviderSpec, workspaceRoot: string, store: DiagnosticsStore, lifecycle: BridgeLifecycleConfig) {
+	constructor(
+		spec: ProviderSpec,
+		workspaceRoot: string,
+		store: DiagnosticsStore,
+		lifecycle: BridgeLifecycleConfig,
+		onChange: () => void,
+	) {
 		this.spec = spec;
 		this.workspaceRoot = workspaceRoot;
 		this.store = store;
 		this.lifecycle = lifecycle;
+		this.onChange = onChange;
+		if (!chooseResolvedCommand(this.workspaceRoot, this.spec.commandCandidates)) {
+			this.status = { state: "missing", message: `Command not found for ${this.spec.id}` };
+		}
 	}
 
 	getStatus(): ProviderStatus {
 		return { ...this.status, backoffUntil: this.backoffUntil || undefined };
+	}
+
+	private setStatus(status: ProviderStatus): void {
+		this.status = status;
+		this.onChange();
 	}
 
 	async schedule(files: string[], reason: TriggerReason): Promise<void> {
@@ -65,10 +81,10 @@ export class CliProvider implements ProviderRuntime {
 			return;
 		}
 		this.inflight = true;
-		this.status = { state: "running", lastRunAt: now() };
+		this.setStatus({ state: "running", lastRunAt: now() });
 		const resolved = chooseResolvedCommand(this.workspaceRoot, this.spec.commandCandidates);
 		if (!resolved) {
-			this.status = { state: "missing", message: `Command not found for ${this.spec.id}` };
+			this.setStatus({ state: "missing", message: `Command not found for ${this.spec.id}` });
 			this.pendingFiles.clear();
 			this.resolvePending();
 			this.inflight = false;
@@ -95,11 +111,11 @@ export class CliProvider implements ProviderRuntime {
 				}
 				this.store.replaceProviderFiles(this.spec.id, byFile);
 			}
-			this.status = { state: "cooldown", lastRunAt: now() };
 			this.backoffUntil = 0;
+			this.setStatus({ state: "cooldown", lastRunAt: now() });
 		} catch (error) {
 			this.backoffUntil = now() + 120_000;
-			this.status = { state: "backoff", message: error instanceof Error ? error.message : String(error), backoffUntil: this.backoffUntil };
+			this.setStatus({ state: "backoff", message: error instanceof Error ? error.message : String(error), backoffUntil: this.backoffUntil });
 		}
 		this.resolvePending();
 		this.inflight = false;
@@ -144,6 +160,6 @@ export class CliProvider implements ProviderRuntime {
 	async suspend(_reason: "idle" | "shutdown" | "reload"): Promise<void> {
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = undefined;
-		this.status = { state: "stopped", lastRunAt: this.status.lastRunAt };
+		this.setStatus({ state: "stopped", lastRunAt: this.status.lastRunAt });
 	}
 }

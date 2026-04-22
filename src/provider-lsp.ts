@@ -37,6 +37,7 @@ export class LspProvider implements ProviderRuntime {
 	private readonly store: DiagnosticsStore;
 	private readonly lifecycle: BridgeLifecycleConfig;
 	private readonly cleanupRegistry: CleanupRegistryLike;
+	private readonly onChange: () => void;
 	private status: ProviderStatus = { state: "stopped" };
 	private pendingFiles = new Set<string>();
 	private pendingResolvers: Array<() => void> = [];
@@ -61,6 +62,7 @@ export class LspProvider implements ProviderRuntime {
 		store: DiagnosticsStore,
 		lifecycle: BridgeLifecycleConfig,
 		cleanupRegistry: CleanupRegistryLike,
+		onChange: () => void,
 	) {
 		this.spec = spec;
 		this.workspaceRoot = workspaceRoot;
@@ -68,10 +70,16 @@ export class LspProvider implements ProviderRuntime {
 		this.store = store;
 		this.lifecycle = lifecycle;
 		this.cleanupRegistry = cleanupRegistry;
+		this.onChange = onChange;
 	}
 
 	getStatus(): ProviderStatus {
 		return { ...this.status, backoffUntil: this.backoffUntil || undefined };
+	}
+
+	private setStatus(status: ProviderStatus): void {
+		this.status = status;
+		this.onChange();
 	}
 
 	async schedule(files: string[], reason: TriggerReason): Promise<void> {
@@ -122,7 +130,7 @@ export class LspProvider implements ProviderRuntime {
 			return;
 		}
 		this.inflight = true;
-		this.status = { state: "running", lastRunAt: now() };
+		this.setStatus({ state: "running", lastRunAt: now() });
 		try {
 			await this.ensureStarted();
 			const files = Array.from(this.pendingFiles);
@@ -132,7 +140,7 @@ export class LspProvider implements ProviderRuntime {
 			}
 			this.bootstrapComplete = true;
 			await this.waitForDiagnostics(files);
-			this.status = { state: "cooldown", lastRunAt: now() };
+			this.setStatus({ state: "cooldown", lastRunAt: now() });
 		} catch (error) {
 			this.registerCrash(error instanceof Error ? error.message : String(error));
 		}
@@ -157,11 +165,11 @@ export class LspProvider implements ProviderRuntime {
 		const attempts = this.crashTimestamps.length;
 		const backoff = attempts === 1 ? 5_000 : attempts === 2 ? 15_000 : attempts === 3 ? 45_000 : 120_000;
 		this.backoffUntil = timestamp + backoff;
-		this.status = {
+		this.setStatus({
 			state: attempts >= 5 ? "disabled" : "backoff",
 			message,
 			backoffUntil: this.backoffUntil,
-		};
+		});
 		void this.suspend("reload");
 	}
 
@@ -173,7 +181,7 @@ export class LspProvider implements ProviderRuntime {
 		if (this.starting) return this.starting;
 		const resolved = chooseResolvedCommand(this.workspaceRoot, this.spec.commandCandidates);
 		if (!resolved) {
-			this.status = { state: "missing", message: `Command not found for ${this.spec.id}` };
+			this.setStatus({ state: "missing", message: `Command not found for ${this.spec.id}` });
 			throw new Error(`Command not found for ${this.spec.id}`);
 		}
 		this.starting = new Promise<void>((resolve, reject) => {
@@ -184,7 +192,7 @@ export class LspProvider implements ProviderRuntime {
 				detached: process.platform !== "win32",
 			});
 			this.process = child;
-			this.status = { state: "starting", lastRunAt: now() };
+			this.setStatus({ state: "starting", lastRunAt: now() });
 			this.cleanupRegistry.register(this.spec.id, child.pid ?? -1, process.platform !== "win32" ? child.pid : undefined);
 			child.stdout.on("data", (chunk: Buffer) => {
 				this.buffer = Buffer.concat([this.buffer, chunk]);
@@ -360,6 +368,7 @@ export class LspProvider implements ProviderRuntime {
 				observedAt: now(),
 			})) satisfies UnifiedDiagnostic[];
 			this.store.replaceProviderFiles(this.spec.id, new Map([[relativePath, diagnostics]]));
+			this.onChange();
 			const waiters = this.waiters.get(filePath) ?? this.waiters.get(relativePath) ?? [];
 			for (const waiter of waiters) waiter();
 			this.waiters.delete(filePath);
@@ -432,6 +441,6 @@ export class LspProvider implements ProviderRuntime {
 		}
 		this.process = undefined;
 		this.cleanupRegistry.unregister(this.spec.id);
-		this.status = { state: "stopped", lastRunAt: this.status.lastRunAt };
+		this.setStatus({ state: "stopped", lastRunAt: this.status.lastRunAt });
 	}
 }
