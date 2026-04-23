@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { relative } from "node:path";
+import type { Logger } from "pino";
 import { parseEslintJson, parseGolangciLintJson, parseRuffJson, parseSarif } from "./cli-parsers.js";
 import { DiagnosticsStore } from "./diagnostics.js";
 import type { BridgeLifecycleConfig, ProviderRuntime, ProviderSpec, ProviderStatus, TriggerReason, UnifiedDiagnostic } from "./types.js";
@@ -26,6 +27,7 @@ export class CliProvider implements ProviderRuntime {
 	private readonly workspaceRoot: string;
 	private readonly lifecycle: BridgeLifecycleConfig;
 	private readonly onChange: () => void;
+	private readonly logger: Logger;
 	private status: ProviderStatus = { state: "stopped" };
 	private timer: NodeJS.Timeout | undefined;
 	private inflight = false;
@@ -40,13 +42,17 @@ export class CliProvider implements ProviderRuntime {
 		store: DiagnosticsStore,
 		lifecycle: BridgeLifecycleConfig,
 		onChange: () => void,
+		logger: Logger,
 	) {
 		this.spec = spec;
 		this.workspaceRoot = workspaceRoot;
 		this.store = store;
 		this.lifecycle = lifecycle;
 		this.onChange = onChange;
+		this.logger = logger;
+		this.logger.debug({ commandCandidates: this.spec.commandCandidates }, "cli provider created");
 		if (!chooseResolvedCommand(this.workspaceRoot, this.spec.commandCandidates)) {
+			this.store.clearProvider(this.spec.id);
 			this.status = { state: "missing", message: `Command not found for ${this.spec.id}` };
 		}
 	}
@@ -56,13 +62,18 @@ export class CliProvider implements ProviderRuntime {
 	}
 
 	private setStatus(status: ProviderStatus): void {
+		const previousState = this.status.state;
 		this.status = status;
+		if (previousState !== status.state) {
+			this.logger.debug({ from: previousState, to: status.state, status }, "cli provider status changed");
+		}
 		this.onChange();
 	}
 
 	async schedule(files: string[], reason: TriggerReason): Promise<void> {
 		if (!this.spec.cli) return;
 		for (const file of files) this.pendingFiles.add(file);
+		this.logger.debug({ reason, files, pendingFiles: Array.from(this.pendingFiles) }, "cli provider scheduled");
 		if (reason === "startup" && this.spec.cli.runOnStartup === false) return;
 		if (reason !== "startup" && this.spec.cli.runOnChange === false) return;
 		if (now() < this.backoffUntil) return;
@@ -84,6 +95,7 @@ export class CliProvider implements ProviderRuntime {
 		this.setStatus({ state: "running", lastRunAt: now() });
 		const resolved = chooseResolvedCommand(this.workspaceRoot, this.spec.commandCandidates);
 		if (!resolved) {
+			this.store.clearProvider(this.spec.id);
 			this.setStatus({ state: "missing", message: `Command not found for ${this.spec.id}` });
 			this.pendingFiles.clear();
 			this.resolvePending();
@@ -91,6 +103,7 @@ export class CliProvider implements ProviderRuntime {
 			return;
 		}
 		const files = Array.from(this.pendingFiles).map((file) => relative(this.workspaceRoot, file) || file);
+		this.logger.debug({ files, mode: this.spec.cli?.mode, resolved }, "cli provider flush start");
 		this.pendingFiles.clear();
 		const args = [...resolved.args];
 		if (this.spec.cli?.mode === "files") args.push(...files);
@@ -112,9 +125,11 @@ export class CliProvider implements ProviderRuntime {
 				this.store.replaceProviderFiles(this.spec.id, byFile);
 			}
 			this.backoffUntil = 0;
+			this.logger.debug({ diagnostics: diagnostics.length, files }, "cli provider flush success");
 			this.setStatus({ state: "cooldown", lastRunAt: now() });
 		} catch (error) {
 			this.backoffUntil = now() + 120_000;
+			this.logger.warn({ error: error instanceof Error ? error.message : String(error) }, "cli provider flush failed");
 			this.setStatus({ state: "backoff", message: error instanceof Error ? error.message : String(error), backoffUntil: this.backoffUntil });
 		}
 		this.resolvePending();
@@ -157,9 +172,10 @@ export class CliProvider implements ProviderRuntime {
 		});
 	}
 
-	async suspend(_reason: "idle" | "shutdown" | "reload"): Promise<void> {
+	async suspend(reason: "idle" | "shutdown" | "reload"): Promise<void> {
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = undefined;
+		this.logger.debug({ reason }, "cli provider suspended");
 		this.setStatus({ state: "stopped", lastRunAt: this.status.lastRunAt });
 	}
 }

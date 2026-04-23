@@ -1,6 +1,7 @@
 import { relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { UnifiedDiagnostic } from "./types.js";
-import { stableDiagnosticId } from "./util.js";
+import { isPathInside, shouldIgnorePath, stableDiagnosticId } from "./util.js";
 
 function severityFromNumber(value: number | undefined): UnifiedDiagnostic["severity"] {
 	if (value === 2) return "warning";
@@ -9,9 +10,22 @@ function severityFromNumber(value: number | undefined): UnifiedDiagnostic["sever
 	return "error";
 }
 
-function normalizePath(workspaceRoot: string, filePath: string): string {
-	const absolute = resolve(workspaceRoot, filePath);
-	return relative(workspaceRoot, absolute).replace(/\\/g, "/") || filePath;
+function normalizePath(workspaceRoot: string, filePath: string): string | null {
+	let absolute: string;
+	try {
+		if (filePath.startsWith("file://")) {
+			absolute = fileURLToPath(filePath);
+		} else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//u.test(filePath)) {
+			return null;
+		} else {
+			absolute = resolve(workspaceRoot, filePath);
+		}
+	} catch {
+		return null;
+	}
+	if (!isPathInside(workspaceRoot, absolute) || shouldIgnorePath(workspaceRoot, absolute)) return null;
+	const rel = relative(workspaceRoot, absolute).replace(/\\/g, "/");
+	return rel === "" ? "." : rel;
 }
 
 function buildDiagnostic(providerId: string, sourceKind: UnifiedDiagnostic["sourceKind"], diagnostic: Omit<UnifiedDiagnostic, "id" | "providerId" | "sourceKind">): UnifiedDiagnostic {
@@ -47,6 +61,7 @@ export function parseEslintJson(providerId: string, workspaceRoot: string, text:
 	const diagnostics: UnifiedDiagnostic[] = [];
 	for (const result of payload) {
 		const filePath = normalizePath(workspaceRoot, result.filePath);
+		if (!filePath) continue;
 		for (const message of result.messages) {
 			diagnostics.push(
 				buildDiagnostic(providerId, "cli", {
@@ -88,6 +103,7 @@ export function parseGolangciLintJson(providerId: string, workspaceRoot: string,
 	const diagnostics: UnifiedDiagnostic[] = [];
 	for (const issue of payload.Issues ?? []) {
 		const filePath = normalizePath(workspaceRoot, issue.Pos?.Filename ?? "unknown");
+		if (!filePath) continue;
 		const severity: UnifiedDiagnostic["severity"] = issue.Severity === "warning" ? "warning" : "error";
 		diagnostics.push(
 			buildDiagnostic(providerId, "cli", {
@@ -120,6 +136,7 @@ export function parseRuffJson(providerId: string, workspaceRoot: string, text: s
 	const diagnostics: UnifiedDiagnostic[] = [];
 	for (const issue of payload) {
 		const filePath = normalizePath(workspaceRoot, issue.filename);
+		if (!filePath) continue;
 		diagnostics.push(
 			buildDiagnostic(providerId, "cli", {
 				filePath,
@@ -169,6 +186,7 @@ export function parseSarif(providerId: string, workspaceRoot: string, text: stri
 		for (const result of run.results ?? []) {
 			const location = result.locations?.[0]?.physicalLocation;
 			const filePath = normalizePath(workspaceRoot, location?.artifactLocation?.uri ?? "unknown");
+			if (!filePath) continue;
 			const severity: UnifiedDiagnostic["severity"] = result.level === "note" ? "info" : result.level === "warning" ? "warning" : "error";
 			diagnostics.push(
 				buildDiagnostic(providerId, "cli", {

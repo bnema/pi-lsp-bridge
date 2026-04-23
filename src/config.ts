@@ -46,6 +46,23 @@ function normalizeStatusSymbols(value: string | undefined): StatusSymbolsMode | 
 	}
 }
 
+function normalizeBoolean(value: string | undefined): boolean | undefined {
+	switch (value?.trim().toLowerCase()) {
+		case "1":
+		case "true":
+		case "yes":
+		case "on":
+			return true;
+		case "0":
+		case "false":
+		case "no":
+		case "off":
+			return false;
+		default:
+			return undefined;
+	}
+}
+
 function mergeProviderSpec(base: ProviderSpec, override: ProviderOverride): ProviderSpec {
 	const commandCandidates = override.command
 		? [{ command: override.command, args: override.args ?? [] }]
@@ -99,24 +116,49 @@ export function loadConfig(workspaceRoot: string): LoadedConfig {
 		repoConfig,
 		opencodeOverrides: opencode,
 		lifecycle,
-		debug: repoConfig.debug === true,
+		debug: normalizeBoolean(process.env.PI_LSP_BRIDGE_DEBUG) ?? repoConfig.debug === true,
 		status,
 	};
 }
 
+function inventoryHasRepoFile(inventory: WorkspaceInventory, names?: string[]): boolean {
+	return names?.some((name) => inventory.basenames.has(name)) ?? false;
+}
+
+function inventoryHasExtension(inventory: WorkspaceInventory, extensions?: string[]): boolean {
+	return extensions?.some((extension) => inventory.extensions.has(extension)) ?? false;
+}
+
+function inventoryHasDependency(inventory: WorkspaceInventory, dependencies?: string[]): boolean {
+	return dependencies?.some((dependency) => inventory.packageJsonDeps.has(dependency)) ?? false;
+}
+
+function inventoryHasSelectorMatch(spec: ProviderSpec, inventory: WorkspaceInventory): boolean {
+	return spec.selectors?.some((selector) => selector.extensions?.some((extension) => inventory.extensions.has(extension)) ?? false) ?? false;
+}
+
+export function providerHasStrongSignal(spec: ProviderSpec, inventory: WorkspaceInventory): boolean {
+	const detection = spec.detect;
+	return (
+		inventoryHasRepoFile(inventory, detection?.repoFilesAny) ||
+		inventoryHasRepoFile(inventory, detection?.configFilesAny) ||
+		inventoryHasDependency(inventory, detection?.packageJsonDepsAny) ||
+		inventoryHasRepoFile(inventory, spec.rootMarkers) ||
+		inventoryHasRepoFile(inventory, spec.configMarkers)
+	);
+}
+
+export function shouldAutostartProvider(spec: ProviderSpec, inventory: WorkspaceInventory): boolean {
+	if (spec.kind === "cli") return spec.cli?.runOnStartup === true;
+	return providerHasStrongSignal(spec, inventory);
+}
+
 function providerMatchesInventory(spec: ProviderSpec, inventory: WorkspaceInventory): boolean {
 	const detection = spec.detect;
-	const hasRepoFile = (names?: string[]) => names?.some((name) => inventory.basenames.has(name)) ?? false;
-	const hasExtension = (extensions?: string[]) => extensions?.some((extension) => inventory.extensions.has(extension)) ?? false;
-	const hasDep = (deps?: string[]) => deps?.some((dependency) => inventory.packageJsonDeps.has(dependency)) ?? false;
-	const selectorMatch =
-		spec.selectors?.some((selector) => selector.extensions?.some((extension) => inventory.extensions.has(extension)) ?? false) ?? false;
 	return (
-		hasRepoFile(detection?.repoFilesAny) ||
-		hasRepoFile(detection?.configFilesAny) ||
-		hasExtension(detection?.fileExtensionsAny) ||
-		hasDep(detection?.packageJsonDepsAny) ||
-		selectorMatch
+		providerHasStrongSignal(spec, inventory) ||
+		inventoryHasExtension(inventory, detection?.fileExtensionsAny) ||
+		inventoryHasSelectorMatch(spec, inventory)
 	);
 }
 

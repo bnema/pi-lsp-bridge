@@ -2,7 +2,7 @@ import { accessSync, existsSync, readdirSync, readFileSync, statSync } from "nod
 import { constants } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CommandCandidate, ResolvedCommand, WorkspaceInventory } from "./types.js";
 
 const IGNORE_DIRS = new Set([
@@ -10,6 +10,7 @@ const IGNORE_DIRS = new Set([
 	".hg",
 	".svn",
 	"node_modules",
+	"vendor",
 	"dist",
 	"build",
 	"target",
@@ -71,12 +72,19 @@ export function findWorkspaceRoot(start: string): string {
 	return resolve(start);
 }
 
-export function shouldIgnorePath(root: string, filePath: string, excludePaths: string[] = []): boolean {
+export function isPathInside(root: string, candidatePath: string): boolean {
+	const rel = relative(resolve(root), resolve(candidatePath));
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+export function shouldIgnorePath(root: string, filePath: string, excludePaths: string[] = [], treatLastSegmentAsDirectory = false): boolean {
 	const rel = toRelative(root, filePath);
 	if (rel === ".") return false;
 	const parts = rel.split("/");
-	for (const part of parts.slice(0, -1)) {
+	const directoryParts = treatLastSegmentAsDirectory ? parts : parts.slice(0, -1);
+	for (const part of directoryParts) {
 		if (IGNORE_DIRS.has(part)) return true;
+		if (part.startsWith(".") && part !== ".pi") return true;
 	}
 	for (const excluded of excludePaths) {
 		if (rel === excluded || rel.startsWith(`${excluded}/`)) return true;
@@ -103,7 +111,7 @@ export function scanWorkspace(root: string, excludePaths: string[] = [], maxFile
 		for (const entry of entries) {
 			const full = join(current, entry.name);
 			if (entry.isDirectory()) {
-				if (shouldIgnorePath(root, full, excludePaths)) continue;
+				if (shouldIgnorePath(root, full, excludePaths, true)) continue;
 				stack.push(full);
 				continue;
 			}

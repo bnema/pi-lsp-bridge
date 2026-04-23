@@ -1,9 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { relative } from "node:path";
+import type { Logger } from "pino";
 import type { BridgeLifecycleConfig, ProviderRuntime, ProviderSpec, ProviderStatus, TriggerReason, UnifiedDiagnostic } from "./types.js";
 import { DiagnosticsStore } from "./diagnostics.js";
-import { chooseResolvedCommand, isLargeFile, now, stableDiagnosticId } from "./util.js";
+import { chooseResolvedCommand, isLargeFile, isPathInside, now, shouldIgnorePath, stableDiagnosticId } from "./util.js";
 
 interface OpenDocument {
 	uri: string;
@@ -38,6 +39,8 @@ export class LspProvider implements ProviderRuntime {
 	private readonly lifecycle: BridgeLifecycleConfig;
 	private readonly cleanupRegistry: CleanupRegistryLike;
 	private readonly onChange: () => void;
+	private readonly logger: Logger;
+	private readonly excludePaths: string[];
 	private status: ProviderStatus = { state: "stopped" };
 	private pendingFiles = new Set<string>();
 	private pendingResolvers: Array<() => void> = [];
@@ -63,6 +66,8 @@ export class LspProvider implements ProviderRuntime {
 		lifecycle: BridgeLifecycleConfig,
 		cleanupRegistry: CleanupRegistryLike,
 		onChange: () => void,
+		logger: Logger,
+		excludePaths: string[] = [],
 	) {
 		this.spec = spec;
 		this.workspaceRoot = workspaceRoot;
@@ -71,6 +76,9 @@ export class LspProvider implements ProviderRuntime {
 		this.lifecycle = lifecycle;
 		this.cleanupRegistry = cleanupRegistry;
 		this.onChange = onChange;
+		this.logger = logger;
+		this.excludePaths = excludePaths;
+		this.logger.debug({ commandCandidates: this.spec.commandCandidates, excludePaths }, "lsp provider created");
 	}
 
 	getStatus(): ProviderStatus {
@@ -78,7 +86,11 @@ export class LspProvider implements ProviderRuntime {
 	}
 
 	private setStatus(status: ProviderStatus): void {
+		const previousState = this.status.state;
 		this.status = status;
+		if (previousState !== status.state) {
+			this.logger.debug({ from: previousState, to: status.state, status }, "lsp provider status changed");
+		}
 		this.onChange();
 	}
 
@@ -86,6 +98,7 @@ export class LspProvider implements ProviderRuntime {
 		for (const file of files) {
 			if (this.matchesFile(file)) this.pendingFiles.add(file);
 		}
+		this.logger.debug({ reason, files, pendingFiles: Array.from(this.pendingFiles) }, "lsp provider scheduled");
 		if (reason === "startup" && !this.bootstrapComplete) {
 			for (const file of this.bootstrapFiles()) this.pendingFiles.add(file);
 		}
@@ -131,6 +144,7 @@ export class LspProvider implements ProviderRuntime {
 		}
 		this.inflight = true;
 		this.setStatus({ state: "running", lastRunAt: now() });
+		this.logger.debug({ pendingFiles: Array.from(this.pendingFiles) }, "lsp provider flush start");
 		try {
 			await this.ensureStarted();
 			const files = Array.from(this.pendingFiles);
@@ -140,9 +154,16 @@ export class LspProvider implements ProviderRuntime {
 			}
 			this.bootstrapComplete = true;
 			await this.waitForDiagnostics(files);
+			this.logger.debug({ files }, "lsp provider flush success");
 			this.setStatus({ state: "cooldown", lastRunAt: now() });
 		} catch (error) {
-			this.registerCrash(error instanceof Error ? error.message : String(error));
+			const message = error instanceof Error ? error.message : String(error);
+			this.logger.warn({ error: message }, "lsp provider flush failed");
+			if (this.status.state === "missing") {
+				this.teardownProcess();
+			} else {
+				this.registerCrash(message);
+			}
 		}
 		this.resolvePending();
 		this.inflight = false;
@@ -159,18 +180,19 @@ export class LspProvider implements ProviderRuntime {
 	}
 
 	private registerCrash(message: string): void {
+		this.logger.warn({ message }, "lsp provider crash registered");
 		const timestamp = now();
 		this.crashTimestamps = this.crashTimestamps.filter((value) => timestamp - value < 10 * 60_000);
 		this.crashTimestamps.push(timestamp);
 		const attempts = this.crashTimestamps.length;
 		const backoff = attempts === 1 ? 5_000 : attempts === 2 ? 15_000 : attempts === 3 ? 45_000 : 120_000;
 		this.backoffUntil = timestamp + backoff;
+		this.teardownProcess();
 		this.setStatus({
 			state: attempts >= 5 ? "disabled" : "backoff",
 			message,
 			backoffUntil: this.backoffUntil,
 		});
-		void this.suspend("reload");
 	}
 
 	private async ensureStarted(): Promise<void> {
@@ -181,9 +203,12 @@ export class LspProvider implements ProviderRuntime {
 		if (this.starting) return this.starting;
 		const resolved = chooseResolvedCommand(this.workspaceRoot, this.spec.commandCandidates);
 		if (!resolved) {
+			this.store.clearProvider(this.spec.id);
+			this.logger.warn("lsp provider command not found");
 			this.setStatus({ state: "missing", message: `Command not found for ${this.spec.id}` });
 			throw new Error(`Command not found for ${this.spec.id}`);
 		}
+		this.logger.debug({ resolved }, "lsp provider starting process");
 		this.starting = new Promise<void>((resolve, reject) => {
 			const child = spawn(resolved.command, resolved.args, {
 				cwd: this.workspaceRoot,
@@ -338,8 +363,14 @@ export class LspProvider implements ProviderRuntime {
 		if (typeof message.method !== "string") return;
 		if (message.method === "textDocument/publishDiagnostics") {
 			const uri = message.params?.uri as string | undefined;
-			if (!uri) return;
-			const filePath = fileURLToPath(uri);
+			if (!uri || !uri.startsWith("file:")) return;
+			let filePath: string;
+			try {
+				filePath = fileURLToPath(uri);
+			} catch {
+				return;
+			}
+			if (!isPathInside(this.workspaceRoot, filePath) || shouldIgnorePath(this.workspaceRoot, filePath, this.excludePaths)) return;
 			const relativePath = relative(this.workspaceRoot, filePath).replace(/\\/g, "/") || filePath;
 			const diagnostics = ((message.params?.diagnostics ?? []) as any[]).map((diagnostic) => ({
 				id: stableDiagnosticId([
@@ -368,6 +399,7 @@ export class LspProvider implements ProviderRuntime {
 				observedAt: now(),
 			})) satisfies UnifiedDiagnostic[];
 			this.store.replaceProviderFiles(this.spec.id, new Map([[relativePath, diagnostics]]));
+			this.logger.debug({ filePath: relativePath, diagnostics: diagnostics.length }, "lsp diagnostics published");
 			this.onChange();
 			const waiters = this.waiters.get(filePath) ?? this.waiters.get(relativePath) ?? [];
 			for (const waiter of waiters) waiter();
@@ -420,9 +452,8 @@ export class LspProvider implements ProviderRuntime {
 		this.process.stdin.write(`Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n${payload}`);
 	}
 
-	async suspend(_reason: "idle" | "shutdown" | "reload"): Promise<void> {
-		if (this.timer) clearTimeout(this.timer);
-		this.timer = undefined;
+	private teardownProcess(): void {
+		this.logger.debug("lsp provider tearing down process");
 		for (const document of this.openDocuments.values()) {
 			this.notify("textDocument/didClose", { textDocument: { uri: document.uri } });
 		}
@@ -441,6 +472,13 @@ export class LspProvider implements ProviderRuntime {
 		}
 		this.process = undefined;
 		this.cleanupRegistry.unregister(this.spec.id);
+	}
+
+	async suspend(reason: "idle" | "shutdown" | "reload"): Promise<void> {
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+		this.logger.debug({ reason }, "lsp provider suspended");
+		this.teardownProcess();
 		this.setStatus({ state: "stopped", lastRunAt: this.status.lastRunAt });
 	}
 }

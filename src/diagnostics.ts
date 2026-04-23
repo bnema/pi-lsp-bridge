@@ -129,6 +129,13 @@ export function formatCounts(counts: DiagnosticsCounts): string {
 	return parts.length > 0 ? parts.join(", ") : "no diagnostics";
 }
 
+export function formatStatusCounts(counts: DiagnosticsCounts): string | null {
+	const parts: string[] = [];
+	if (counts.error) parts.push(`${counts.error} error${counts.error === 1 ? "" : "s"}`);
+	if (counts.warning) parts.push(`${counts.warning} warning${counts.warning === 1 ? "" : "s"}`);
+	return parts.length > 0 ? parts.join(", ") : null;
+}
+
 export function formatDiagnosticLine(diagnostic: UnifiedDiagnostic): string {
 	const line = (diagnostic.range?.start.line ?? 0) + 1;
 	const column = (diagnostic.range?.start.character ?? 0) + 1;

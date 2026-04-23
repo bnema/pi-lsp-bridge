@@ -80,6 +80,7 @@ Example:
 {
   "$schema": "./node_modules/pi-lsp-bridge/schemas/repo-config.schema.json",
   "autoDetect": true,
+  "debug": false,
   "status": {
     "symbols": "nerdfont"
   },
@@ -107,7 +108,37 @@ You can also override it per session with:
 PI_LSP_BRIDGE_STATUS_SYMBOLS=text pi -e .
 ```
 
+Enable debug logging with either repo config or an environment variable:
+
+```json
+{
+  "debug": true
+}
+```
+
+```bash
+PI_LSP_BRIDGE_DEBUG=1 pi -e .
+```
+
+When debug logging is enabled, the bridge writes a per-session pino log to:
+
+```text
+$XDG_STATE_HOME/pi-lsp-bridge/<session-id>.log
+```
+
+or, if `XDG_STATE_HOME` is unset:
+
+```text
+~/.local/state/pi-lsp-bridge/<session-id>.log
+```
+
 The status bar only shows active providers (`starting`, `running`, `cooldown`). Inactive ones such as missing, stopped, backoff, or disabled are hidden.
+
+On startup, the bridge eagerly starts only providers with strong repo signals (for example `go.mod`, `Cargo.toml`, `tsconfig.json`, package dependencies, or explicit config markers). Generic extension-only providers such as Markdown, JSON, YAML, HTML, or CSS wait until a matching file is touched.
+
+Status-bar counts are intentionally compact: they emphasize errors and warnings. Hints and info remain available through the diagnostics tool and prompt summaries.
+
+`vendor/` is always ignored. Vendored dependencies are treated as external code and are never scanned, scheduled, or surfaced as actionable diagnostics.
 
 ## OpenCode compatibility
 

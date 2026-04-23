@@ -1,8 +1,10 @@
 {
   "name": "pi-lsp-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Minimal, data-driven diagnostics bridge for pi using LSPs and repo-configured linters.",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "type": "module",
   "private": true,
   "scripts": {
@@ -10,14 +12,19 @@
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*",
-    "@mariozechner/pi-tui": "*"
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
   },
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {
+    "pino": "^10.3.1"
   }
 }

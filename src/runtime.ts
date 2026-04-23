@@ -1,7 +1,9 @@
 import { relative, resolve } from "node:path";
+import type { Logger } from "pino";
 import { CleanupRegistry } from "./cleanup.js";
-import { loadConfig, selectProviders } from "./config.js";
-import { buildFileSummary, buildPromptSummary, DiagnosticsStore, formatCounts } from "./diagnostics.js";
+import { loadConfig, selectProviders, shouldAutostartProvider } from "./config.js";
+import { buildFileSummary, buildPromptSummary, DiagnosticsStore, formatStatusCounts } from "./diagnostics.js";
+import { createSessionLogger } from "./logger.js";
 import { CliProvider } from "./provider-cli.js";
 import { LspProvider } from "./provider-lsp.js";
 import type {
@@ -12,7 +14,7 @@ import type {
 	StatusSymbolsMode,
 	TriggerReason,
 } from "./types.js";
-import { findWorkspaceRoot, now, scanWorkspace, toRelative } from "./util.js";
+import { findWorkspaceRoot, hashText, isPathInside, now, scanWorkspace, shouldIgnorePath, toRelative } from "./util.js";
 
 const GLOBAL_HANDLERS = new Set<string>();
 let PROCESS_CLEANUP: (() => Promise<void>) | undefined;
@@ -208,6 +210,8 @@ export class WorkspaceBridge {
 	readonly store = new DiagnosticsStore();
 	private lifecycle: BridgeLifecycleConfig;
 	private cleanupRegistry: CleanupRegistry;
+	private readonly logger: Logger;
+	private readonly debugLogPath?: string;
 	private providers: ProviderRuntime[] = [];
 	private readonly listeners = new Set<() => void>();
 	private inventory = scanWorkspace(process.cwd());
@@ -217,22 +221,39 @@ export class WorkspaceBridge {
 	private idleTimer: NodeJS.Timeout | undefined;
 	private lastInjectionDigest = "";
 	private lastInjectionAt = 0;
+	private lastSurfacedSummaryDigest = "";
 	private rediscoverTimer: NodeJS.Timeout | undefined;
 
-	private constructor(workspaceRoot: string, lifecycle: BridgeLifecycleConfig, cleanupRegistry: CleanupRegistry) {
+	private constructor(
+		workspaceRoot: string,
+		lifecycle: BridgeLifecycleConfig,
+		cleanupRegistry: CleanupRegistry,
+		logger: Logger,
+		debugLogPath?: string,
+	) {
 		this.workspaceRoot = workspaceRoot;
 		this.lifecycle = lifecycle;
 		this.cleanupRegistry = cleanupRegistry;
+		this.logger = logger;
+		this.debugLogPath = debugLogPath;
 	}
 
-	static create(cwd: string): WorkspaceBridge {
+	static create(cwd: string, options?: { sessionId?: string }): WorkspaceBridge {
 		const workspaceRoot = findWorkspaceRoot(cwd);
 		const loaded = loadConfig(workspaceRoot);
 		const cleanupRegistry = new CleanupRegistry(workspaceRoot, loaded.lifecycle.orphanSweepMaxAgeMs);
-		const bridge = new WorkspaceBridge(workspaceRoot, loaded.lifecycle, cleanupRegistry);
+		const sessionLogger = createSessionLogger({ enabled: loaded.debug, sessionId: options?.sessionId, workspaceRoot });
+		const bridge = new WorkspaceBridge(workspaceRoot, loaded.lifecycle, cleanupRegistry, sessionLogger.logger, sessionLogger.filePath);
 		bridge.debug = loaded.debug;
 		bridge.excludePaths = loaded.repoConfig.excludePaths ?? [];
 		bridge.statusSymbols = loaded.status.symbols;
+		bridge.logDebug("bridge.create", {
+			sessionId: options?.sessionId,
+			debug: loaded.debug,
+			statusSymbols: loaded.status.symbols,
+			excludePaths: bridge.excludePaths,
+			debugLogPath: sessionLogger.filePath,
+		});
 		bridge.rediscover();
 		bridge.touchActivity();
 		bridge.installProcessHandlers();
@@ -269,9 +290,19 @@ export class WorkspaceBridge {
 		}
 	}
 
+	getDebugLogPath(): string | undefined {
+		return this.debugLogPath;
+	}
+
+	logDebug(message: string, details?: Record<string, unknown>): void {
+		this.logger.debug(details ?? {}, message);
+	}
+
 	private buildProviders(specs: ProviderSpec[]): ProviderRuntime[] {
+		this.logDebug("providers.build", { providerIds: specs.map((spec) => spec.id) });
 		return specs.map((spec) => {
-			if (spec.kind === "cli") return new CliProvider(spec, this.workspaceRoot, this.store, this.lifecycle, () => this.emitChange());
+			const providerLogger = this.logger.child({ providerId: spec.id, providerKind: spec.kind });
+			if (spec.kind === "cli") return new CliProvider(spec, this.workspaceRoot, this.store, this.lifecycle, () => this.emitChange(), providerLogger);
 			return new LspProvider(
 				spec,
 				this.workspaceRoot,
@@ -280,6 +311,8 @@ export class WorkspaceBridge {
 				this.lifecycle,
 				this.cleanupRegistry,
 				() => this.emitChange(),
+				providerLogger,
+				this.excludePaths,
 			);
 		});
 	}
@@ -292,6 +325,13 @@ export class WorkspaceBridge {
 		this.statusSymbols = loaded.status.symbols;
 		this.inventory = scanWorkspace(this.workspaceRoot, this.excludePaths);
 		const specs = selectProviders(this.inventory, loaded);
+		this.logDebug("bridge.rediscover", {
+			debug: loaded.debug,
+			files: this.inventory.files.length,
+			extensions: this.inventory.extensions.size,
+			packageDeps: this.inventory.packageJsonDeps.size,
+			selectedProviders: specs.map((spec) => spec.id),
+		});
 		const nextProviders = this.buildProviders(specs);
 		void this.replaceProviders(nextProviders);
 	}
@@ -299,17 +339,23 @@ export class WorkspaceBridge {
 	private async replaceProviders(nextProviders: ProviderRuntime[]): Promise<void> {
 		const previous = this.providers;
 		this.providers = nextProviders;
-		this.emitChange();
 		for (const provider of previous) {
 			await provider.suspend("reload");
+			this.store.clearProvider(provider.spec.id);
 		}
-		for (const provider of this.providers) {
-			await provider.schedule([], "startup");
-		}
+		this.emitChange();
+		const autostartProviders = this.providers.filter((provider) => shouldAutostartProvider(provider.spec, this.inventory));
+		this.logDebug("providers.replace", {
+			previous: previous.map((provider) => provider.spec.id),
+			next: nextProviders.map((provider) => provider.spec.id),
+			autostart: autostartProviders.map((provider) => provider.spec.id),
+		});
+		await Promise.all(autostartProviders.map((provider) => provider.schedule([], "startup")));
 	}
 
 	private scheduleRediscover(): void {
 		if (this.rediscoverTimer) clearTimeout(this.rediscoverTimer);
+		this.logDebug("bridge.rediscover.scheduled");
 		this.rediscoverTimer = setTimeout(() => this.rediscover(), 2_000);
 	}
 
@@ -336,6 +382,7 @@ export class WorkspaceBridge {
 	}
 
 	async shutdown(reason: "idle" | "shutdown" | "reload"): Promise<void> {
+		this.logDebug("bridge.shutdown", { reason });
 		if (this.idleTimer) clearTimeout(this.idleTimer);
 		if (this.rediscoverTimer) clearTimeout(this.rediscoverTimer);
 		await this.suspendProviders(reason);
@@ -347,7 +394,11 @@ export class WorkspaceBridge {
 
 	async handleTouchedFiles(paths: string[], reason: TriggerReason): Promise<string | null> {
 		this.touchActivity();
-		const files = paths.map((path) => resolve(path)).filter((path) => path.startsWith(this.workspaceRoot));
+		const files = paths
+			.map((path) => resolve(path))
+			.filter((path) => isPathInside(this.workspaceRoot, path))
+			.filter((path) => !shouldIgnorePath(this.workspaceRoot, path, this.excludePaths));
+		this.logDebug("bridge.handleTouchedFiles", { reason, inputPaths: paths, files });
 		if (files.some((file) => discoveryRelevantFile(toRelative(this.workspaceRoot, file)))) {
 			this.scheduleRediscover();
 		}
@@ -357,6 +408,10 @@ export class WorkspaceBridge {
 		const backgroundProviders = this.providers.filter(
 			(provider) => provider.spec.kind === "cli" && provider.spec.cli?.mode === "workspace",
 		);
+		this.logDebug("bridge.handleTouchedFiles.providers", {
+			awaited: awaitedProviders.map((provider) => provider.spec.id),
+			background: backgroundProviders.map((provider) => provider.spec.id),
+		});
 		await Promise.all(awaitedProviders.map((provider) => provider.schedule(files, reason)));
 		for (const provider of backgroundProviders) void provider.schedule(files, reason);
 		const summaries: string[] = [];
@@ -365,34 +420,53 @@ export class WorkspaceBridge {
 			const summary = buildFileSummary(relativePath, this.store.getByFile(relativePath), 6);
 			if (summary) summaries.push(summary);
 		}
-		return summaries.length > 0 ? summaries.join("\n\n") : null;
+		if (summaries.length === 0) {
+			this.logDebug("bridge.handleTouchedFiles.noSummary", { reason, files });
+			return null;
+		}
+		const summary = summaries.join("\n\n");
+		const digest = hashText(summary);
+		if (digest === this.lastSurfacedSummaryDigest) {
+			this.logDebug("bridge.handleTouchedFiles.duplicateSummary", { reason, files });
+			return null;
+		}
+		this.lastSurfacedSummaryDigest = digest;
+		this.logDebug("bridge.handleTouchedFiles.summary", { reason, files, summary });
+		return summary;
 	}
 
 	buildPromptContext(): string | null {
 		this.touchActivity();
 		const diagnostics = this.store.getAll();
-		if (diagnostics.length === 0) return null;
+		if (diagnostics.length === 0) {
+			this.logDebug("bridge.buildPromptContext.empty");
+			return null;
+		}
 		const digest = JSON.stringify({ version: this.store.getVersion(), counts: this.store.getCounts(diagnostics) });
 		if (digest === this.lastInjectionDigest && now() - this.lastInjectionAt < this.lifecycle.injectCooldownMs) {
+			this.logDebug("bridge.buildPromptContext.cooldown", { injectCooldownMs: this.lifecycle.injectCooldownMs });
 			return null;
 		}
 		this.lastInjectionDigest = digest;
 		this.lastInjectionAt = now();
+		this.logDebug("bridge.buildPromptContext.summary", { diagnostics: diagnostics.length });
 		return buildPromptSummary(diagnostics, 8);
 	}
 
 	statusText(): string {
-		const counts = formatCounts(this.store.getCounts());
+		const counts = formatStatusCounts(this.store.getCounts());
 		const providerText = this.providers
 			.map((provider) => ({ provider, status: provider.getStatus() }))
 			.filter(({ status }) => status.state === "starting" || status.state === "running" || status.state === "cooldown")
 			.map(({ provider, status }) => formatProviderStatus(provider.spec, status, this.statusSymbols))
 			.join(" · ");
-		return `lsp-bridge ${counts}${providerText ? ` | ${providerText}` : ""}`;
+		const segments = [counts, providerText].filter((value): value is string => Boolean(value));
+		return segments.length > 0 ? `lsp-bridge ${segments.join(" | ")}` : "lsp-bridge";
 	}
 
 	diagnosticsText(options?: { path?: string; providerId?: string; maxItems?: number }): string {
 		const maxItems = options?.maxItems ?? 25;
+		this.logDebug("bridge.diagnosticsText", { options, maxItems });
 		if (options?.providerId) {
 			const diagnostics = this.store.getByProvider(options.providerId);
 			const summary = buildPromptSummary(diagnostics, maxItems);
@@ -400,7 +474,11 @@ export class WorkspaceBridge {
 		}
 		if (options?.path) {
 			const normalized = options.path.replace(/^@/, "");
-			const relativePath = normalized.startsWith(this.workspaceRoot) ? toRelative(this.workspaceRoot, normalized) : normalized;
+			const candidatePath = resolve(this.workspaceRoot, normalized);
+			if (!isPathInside(this.workspaceRoot, candidatePath)) {
+				return `Path is outside workspace: ${normalized}.`;
+			}
+			const relativePath = toRelative(this.workspaceRoot, candidatePath);
 			const summary = buildFileSummary(relativePath, this.store.getByFile(relativePath), maxItems);
 			return summary ?? `No diagnostics for ${relativePath}.`;
 		}

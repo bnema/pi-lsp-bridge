@@ -6,6 +6,7 @@ export type TriggerReason =
 	| "read"
 	| "edit"
 	| "write"
+	| "bash"
 	| "config-change"
 	| "manual"
 	| "prompt"
