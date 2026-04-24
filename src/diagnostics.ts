@@ -31,10 +31,27 @@ function countDiagnostics(diagnostics: UnifiedDiagnostic[]): DiagnosticsCounts {
 
 const REPEATED_DIAGNOSTIC_MIN_FILES = 2;
 const SUMMARY_EXAMPLE_FILE_LIMIT = 3;
+const PI_PEER_DEPENDENCY_HINT =
+	"Hint: Pi peer dependency not resolvable from workspace node_modules; run npm install or configure Pi SDK paths.";
+const PI_PEER_DEPENDENCY_MODULES = new Set(["typebox", "@sinclair/typebox"]);
+const SECONDARY_DIAGNOSTIC_GROUP_MIN_COUNT = 2;
+const MISSING_MODULE_PATTERNS = [
+	/Cannot find module ['"]([^'"]+)['"]/u,
+	/Could not find a declaration file for module ['"]([^'"]+)['"]/u,
+];
 
 type DiagnosticSummaryEntry =
 	| { kind: "single"; diagnostic: UnifiedDiagnostic }
-	| { kind: "group"; representative: UnifiedDiagnostic; diagnostics: UnifiedDiagnostic[]; filePaths: string[] };
+	| { kind: "group"; representative: UnifiedDiagnostic; diagnostics: UnifiedDiagnostic[]; filePaths: string[] }
+	| { kind: "secondary"; roots: UnifiedDiagnostic[]; diagnostics: UnifiedDiagnostic[]; filePaths: string[] };
+
+interface ModuleResolutionCluster {
+	rootsByFile: Map<string, UnifiedDiagnostic[]>;
+	secondaryByFile: Map<string, UnifiedDiagnostic[]>;
+	secondaryIds: Set<string>;
+	rootCount: number;
+	secondaryCount: number;
+}
 
 export function diagnosticIssueKey(diagnostic: UnifiedDiagnostic): string {
 	return stableDiagnosticId([
@@ -46,14 +63,68 @@ export function diagnosticIssueKey(diagnostic: UnifiedDiagnostic): string {
 	]);
 }
 
+function missingModuleName(diagnostic: UnifiedDiagnostic): string | null {
+	if (diagnostic.severity !== "error") return null;
+	for (const pattern of MISSING_MODULE_PATTERNS) {
+		const match = diagnostic.message.match(pattern);
+		if (match?.[1]) return match[1];
+	}
+	return null;
+}
+
+function isModuleResolutionRoot(diagnostic: UnifiedDiagnostic): boolean {
+	return missingModuleName(diagnostic) !== null;
+}
+
+function isPiPeerDependencyModule(moduleName: string): boolean {
+	return (
+		moduleName.startsWith("@mariozechner/pi-") ||
+		moduleName === "typebox" ||
+		moduleName.startsWith("typebox/") ||
+		moduleName === "@sinclair/typebox" ||
+		moduleName.startsWith("@sinclair/typebox/") ||
+		PI_PEER_DEPENDENCY_MODULES.has(moduleName)
+	);
+}
+
+function isPiPeerDependencyRoot(diagnostic: UnifiedDiagnostic): boolean {
+	const moduleName = missingModuleName(diagnostic);
+	return moduleName !== null && isPiPeerDependencyModule(moduleName);
+}
+
+function collectModuleResolutionCluster(diagnostics: UnifiedDiagnostic[]): ModuleResolutionCluster {
+	const rootsByFile = new Map<string, UnifiedDiagnostic[]>();
+	for (const diagnostic of diagnostics) {
+		if (!isModuleResolutionRoot(diagnostic)) continue;
+		const roots = rootsByFile.get(diagnostic.filePath) ?? [];
+		roots.push(diagnostic);
+		rootsByFile.set(diagnostic.filePath, roots);
+	}
+
+	const secondaryByFile = new Map<string, UnifiedDiagnostic[]>();
+	const secondaryIds = new Set<string>();
+	for (const [filePath, roots] of rootsByFile) {
+		const secondary = diagnostics.filter((diagnostic) => diagnostic.filePath === filePath && !roots.some((root) => root.id === diagnostic.id));
+		if (secondary.length < SECONDARY_DIAGNOSTIC_GROUP_MIN_COUNT) continue;
+		secondaryByFile.set(filePath, secondary);
+		for (const diagnostic of secondary) secondaryIds.add(diagnostic.id);
+	}
+
+	const rootCount = Array.from(rootsByFile.values()).reduce((count, roots) => count + roots.length, 0);
+	const secondaryCount = Array.from(secondaryByFile.values()).reduce((count, secondary) => count + secondary.length, 0);
+	return { rootsByFile, secondaryByFile, secondaryIds, rootCount, secondaryCount };
+}
+
 function uniqueFilePaths(diagnostics: UnifiedDiagnostic[]): string[] {
 	return Array.from(new Set(diagnostics.map((diagnostic) => diagnostic.filePath))).sort((left, right) => left.localeCompare(right));
 }
 
 function buildSummaryEntries(diagnostics: UnifiedDiagnostic[]): DiagnosticSummaryEntry[] {
 	const sorted = sortDiagnostics(diagnostics);
+	const cluster = collectModuleResolutionCluster(sorted);
 	const buckets = new Map<string, UnifiedDiagnostic[]>();
 	for (const diagnostic of sorted) {
+		if (cluster.secondaryIds.has(diagnostic.id)) continue;
 		const key = diagnosticIssueKey(diagnostic);
 		const bucket = buckets.get(key) ?? [];
 		bucket.push(diagnostic);
@@ -61,8 +132,27 @@ function buildSummaryEntries(diagnostics: UnifiedDiagnostic[]): DiagnosticSummar
 	}
 
 	const emittedGroups = new Set<string>();
+	const emittedSecondaryFiles = new Set<string>();
 	const entries: DiagnosticSummaryEntry[] = [];
+	const appendSecondaryForFiles = (filePaths: string[]) => {
+		const diagnosticsForFiles: UnifiedDiagnostic[] = [];
+		const filesWithSecondary: string[] = [];
+		const rootsForFiles: UnifiedDiagnostic[] = [];
+		for (const filePath of filePaths) {
+			rootsForFiles.push(...(cluster.rootsByFile.get(filePath) ?? []));
+			if (emittedSecondaryFiles.has(filePath)) continue;
+			const secondary = cluster.secondaryByFile.get(filePath) ?? [];
+			if (secondary.length === 0) continue;
+			emittedSecondaryFiles.add(filePath);
+			diagnosticsForFiles.push(...secondary);
+			filesWithSecondary.push(filePath);
+		}
+		if (diagnosticsForFiles.length === 0) return;
+		entries.push({ kind: "secondary", roots: rootsForFiles, diagnostics: diagnosticsForFiles, filePaths: filesWithSecondary });
+	};
+
 	for (const diagnostic of sorted) {
+		if (cluster.secondaryIds.has(diagnostic.id)) continue;
 		const key = diagnosticIssueKey(diagnostic);
 		const bucket = buckets.get(key) ?? [diagnostic];
 		const filePaths = uniqueFilePaths(bucket);
@@ -70,15 +160,26 @@ function buildSummaryEntries(diagnostics: UnifiedDiagnostic[]): DiagnosticSummar
 			if (emittedGroups.has(key)) continue;
 			emittedGroups.add(key);
 			entries.push({ kind: "group", representative: bucket[0] ?? diagnostic, diagnostics: bucket, filePaths });
+			if (bucket.some(isModuleResolutionRoot)) appendSecondaryForFiles(filePaths);
 			continue;
 		}
 		entries.push({ kind: "single", diagnostic });
+		if (isModuleResolutionRoot(diagnostic)) appendSecondaryForFiles([diagnostic.filePath]);
 	}
 	return entries;
 }
 
 function countDiagnosticsInEntries(entries: DiagnosticSummaryEntry[]): number {
-	return entries.reduce((count, entry) => count + (entry.kind === "group" ? entry.diagnostics.length : 1), 0);
+	return entries.reduce((count, entry) => count + (entry.kind === "single" ? 1 : entry.diagnostics.length), 0);
+}
+
+function formatCountsWithCluster(diagnostics: UnifiedDiagnostic[]): string {
+	const counts = formatCounts(countDiagnostics(diagnostics));
+	const cluster = collectModuleResolutionCluster(diagnostics);
+	if (cluster.secondaryCount === 0) return counts;
+	const secondaryPlural = cluster.secondaryCount === 1 ? "diagnostic" : "diagnostics";
+	const rootPlural = cluster.rootCount === 1 ? "root" : "roots";
+	return `${counts} (${cluster.secondaryCount} secondary ${secondaryPlural} grouped under ${cluster.rootCount} module-resolution ${rootPlural})`;
 }
 
 function formatDiagnosticGroup(entry: Extract<DiagnosticSummaryEntry, { kind: "group" }>): string {
@@ -90,14 +191,34 @@ function formatDiagnosticGroup(entry: Extract<DiagnosticSummaryEntry, { kind: "g
 	const exampleFiles = entry.filePaths.slice(0, SUMMARY_EXAMPLE_FILE_LIMIT);
 	const moreExamples = entry.filePaths.length > SUMMARY_EXAMPLE_FILE_LIMIT ? `, … ${entry.filePaths.length - SUMMARY_EXAMPLE_FILE_LIMIT} more` : "";
 	const examples = exampleFiles.length > 0 ? ` (examples: ${exampleFiles.join(", ")}${moreExamples})` : "";
+	const hint = isPiPeerDependencyRoot(entry.representative) ? ` ${PI_PEER_DEPENDENCY_HINT}` : "";
 	return `${entry.representative.severity.toUpperCase()}: repeated in ${occurrences}${code} ${clipText(
 		compactWhitespace(entry.representative.message),
 		220,
-	)}${examples}`;
+	)}${examples}${hint}`;
+}
+
+function formatSecondaryDiagnostics(entry: Extract<DiagnosticSummaryEntry, { kind: "secondary" }>): string {
+	const rootCount = entry.roots.length;
+	const moduleNames = Array.from(new Set(entry.roots.map(missingModuleName).filter((name): name is string => name !== null)));
+	const displayedModules = moduleNames.slice(0, SUMMARY_EXAMPLE_FILE_LIMIT);
+	const moreModules = moduleNames.length > SUMMARY_EXAMPLE_FILE_LIMIT ? `, … ${moduleNames.length - SUMMARY_EXAMPLE_FILE_LIMIT} more` : "";
+	const moduleText = displayedModules.length > 0 ? ` (${displayedModules.join(", ")}${moreModules})` : "";
+	const fileText = entry.filePaths.length === 1 ? entry.filePaths[0] : `${entry.filePaths.length} files`;
+	const diagnosticPlural = entry.diagnostics.length === 1 ? "diagnostic" : "diagnostics";
+	const rootPlural = rootCount === 1 ? "root" : "roots";
+	return `SECONDARY: grouped ${entry.diagnostics.length} additional ${diagnosticPlural} in ${fileText} under ${rootCount} module-resolution ${rootPlural}${moduleText}. Fix the root import error first, then re-check the full diagnostics.`;
 }
 
 function formatSummaryEntry(entry: DiagnosticSummaryEntry): string {
-	return entry.kind === "group" ? formatDiagnosticGroup(entry) : formatDiagnosticLine(entry.diagnostic);
+	switch (entry.kind) {
+		case "group":
+			return formatDiagnosticGroup(entry);
+		case "secondary":
+			return formatSecondaryDiagnostics(entry);
+		case "single":
+			return formatDiagnosticLine(entry.diagnostic);
+	}
 }
 
 function mergeDuplicates(diagnostics: UnifiedDiagnostic[]): UnifiedDiagnostic[] {
@@ -212,12 +333,13 @@ export function formatDiagnosticLine(diagnostic: UnifiedDiagnostic): string {
 	const column = (diagnostic.range?.start.character ?? 0) + 1;
 	const location = diagnostic.range ? `:${line}:${column}` : "";
 	const code = diagnostic.code ? ` [${diagnostic.code}]` : "";
-	return `${diagnostic.severity.toUpperCase()}: ${diagnostic.filePath}${location}${code} ${clipText(compactWhitespace(diagnostic.message), 220)}`;
+	const hint = isPiPeerDependencyRoot(diagnostic) ? ` ${PI_PEER_DEPENDENCY_HINT}` : "";
+	return `${diagnostic.severity.toUpperCase()}: ${diagnostic.filePath}${location}${code} ${clipText(compactWhitespace(diagnostic.message), 220)}${hint}`;
 }
 
 export function buildFileSummary(filePath: string, diagnostics: UnifiedDiagnostic[], maxItems = 8): string | null {
 	if (diagnostics.length === 0) return null;
-	const counts = formatCounts(countDiagnostics(diagnostics));
+	const counts = formatCountsWithCluster(diagnostics);
 	const entries = buildSummaryEntries(diagnostics);
 	const lines = [`Diagnostics for ${filePath}: ${counts}`];
 	for (const entry of entries.slice(0, maxItems)) lines.push(`- ${formatSummaryEntry(entry)}`);
@@ -228,7 +350,7 @@ export function buildFileSummary(filePath: string, diagnostics: UnifiedDiagnosti
 
 export function buildDiagnosticsUpdateSummary(diagnostics: UnifiedDiagnostic[], maxItems = 8): string | null {
 	if (diagnostics.length === 0) return null;
-	const counts = formatCounts(countDiagnostics(diagnostics));
+	const counts = formatCountsWithCluster(diagnostics);
 	const entries = buildSummaryEntries(diagnostics);
 	const lines = [`Current diagnostics for touched files: ${counts}.`];
 	for (const entry of entries.slice(0, maxItems)) lines.push(`- ${formatSummaryEntry(entry)}`);
@@ -239,7 +361,7 @@ export function buildDiagnosticsUpdateSummary(diagnostics: UnifiedDiagnostic[], 
 
 export function buildPromptSummary(diagnostics: UnifiedDiagnostic[], maxItems = 8): string | null {
 	if (diagnostics.length === 0) return null;
-	const counts = formatCounts(countDiagnostics(diagnostics));
+	const counts = formatCountsWithCluster(diagnostics);
 	const entries = buildSummaryEntries(diagnostics);
 	const lines = [
 		"Background diagnostics snapshot:",
