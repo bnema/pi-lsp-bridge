@@ -2,7 +2,7 @@ import { relative, resolve } from "node:path";
 import type { Logger } from "pino";
 import { CleanupRegistry } from "./cleanup.js";
 import { loadConfig, selectProviders, shouldAutostartProvider } from "./config.js";
-import { buildFileSummary, buildPromptSummary, DiagnosticsStore, formatStatusCounts } from "./diagnostics.js";
+import { buildDiagnosticsUpdateSummary, buildFileSummary, buildPromptSummary, DiagnosticsStore, formatStatusCounts } from "./diagnostics.js";
 import { createSessionLogger } from "./logger.js";
 import { CliProvider } from "./provider-cli.js";
 import { LspProvider } from "./provider-lsp.js";
@@ -216,7 +216,6 @@ export class WorkspaceBridge {
 	private readonly listeners = new Set<() => void>();
 	private inventory = scanWorkspace(process.cwd());
 	private excludePaths: string[] = [];
-	private debug = false;
 	private statusSymbols: StatusSymbolsMode = "nerdfont";
 	private idleTimer: NodeJS.Timeout | undefined;
 	private lastInjectionDigest = "";
@@ -244,7 +243,6 @@ export class WorkspaceBridge {
 		const cleanupRegistry = new CleanupRegistry(workspaceRoot, loaded.lifecycle.orphanSweepMaxAgeMs);
 		const sessionLogger = createSessionLogger({ enabled: loaded.debug, sessionId: options?.sessionId, workspaceRoot });
 		const bridge = new WorkspaceBridge(workspaceRoot, loaded.lifecycle, cleanupRegistry, sessionLogger.logger, sessionLogger.filePath);
-		bridge.debug = loaded.debug;
 		bridge.excludePaths = loaded.repoConfig.excludePaths ?? [];
 		bridge.statusSymbols = loaded.status.symbols;
 		bridge.logDebug("bridge.create", {
@@ -320,7 +318,6 @@ export class WorkspaceBridge {
 	rediscover(): void {
 		const loaded = loadConfig(this.workspaceRoot);
 		this.lifecycle = loaded.lifecycle;
-		this.debug = loaded.debug;
 		this.excludePaths = loaded.repoConfig.excludePaths ?? [];
 		this.statusSymbols = loaded.status.symbols;
 		this.inventory = scanWorkspace(this.workspaceRoot, this.excludePaths);
@@ -394,10 +391,14 @@ export class WorkspaceBridge {
 
 	async handleTouchedFiles(paths: string[], reason: TriggerReason): Promise<string | null> {
 		this.touchActivity();
-		const files = paths
-			.map((path) => resolve(path))
-			.filter((path) => isPathInside(this.workspaceRoot, path))
-			.filter((path) => !shouldIgnorePath(this.workspaceRoot, path, this.excludePaths));
+		const files = Array.from(
+			new Set(
+				paths
+					.map((path) => resolve(path))
+					.filter((path) => isPathInside(this.workspaceRoot, path))
+					.filter((path) => !shouldIgnorePath(this.workspaceRoot, path, this.excludePaths)),
+			),
+		);
 		this.logDebug("bridge.handleTouchedFiles", { reason, inputPaths: paths, files });
 		if (files.some((file) => discoveryRelevantFile(toRelative(this.workspaceRoot, file)))) {
 			this.scheduleRediscover();
@@ -414,17 +415,15 @@ export class WorkspaceBridge {
 		});
 		await Promise.all(awaitedProviders.map((provider) => provider.schedule(files, reason)));
 		for (const provider of backgroundProviders) void provider.schedule(files, reason);
-		const summaries: string[] = [];
-		for (const file of files) {
+		const diagnostics = files.flatMap((file) => {
 			const relativePath = relative(this.workspaceRoot, file).replace(/\\/g, "/") || file;
-			const summary = buildFileSummary(relativePath, this.store.getByFile(relativePath), 6);
-			if (summary) summaries.push(summary);
-		}
-		if (summaries.length === 0) {
+			return this.store.getByFile(relativePath);
+		});
+		const summary = buildDiagnosticsUpdateSummary(diagnostics, 8);
+		if (!summary) {
 			this.logDebug("bridge.handleTouchedFiles.noSummary", { reason, files });
 			return null;
 		}
-		const summary = summaries.join("\n\n");
 		const digest = hashText(summary);
 		if (digest === this.lastSurfacedSummaryDigest) {
 			this.logDebug("bridge.handleTouchedFiles.duplicateSummary", { reason, files });

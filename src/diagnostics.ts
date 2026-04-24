@@ -29,6 +29,77 @@ function countDiagnostics(diagnostics: UnifiedDiagnostic[]): DiagnosticsCounts {
 	return counts;
 }
 
+const REPEATED_DIAGNOSTIC_MIN_FILES = 2;
+const SUMMARY_EXAMPLE_FILE_LIMIT = 3;
+
+type DiagnosticSummaryEntry =
+	| { kind: "single"; diagnostic: UnifiedDiagnostic }
+	| { kind: "group"; representative: UnifiedDiagnostic; diagnostics: UnifiedDiagnostic[]; filePaths: string[] };
+
+export function diagnosticIssueKey(diagnostic: UnifiedDiagnostic): string {
+	return stableDiagnosticId([
+		diagnostic.providerId,
+		diagnostic.sourceKind,
+		diagnostic.severity,
+		diagnostic.code,
+		compactWhitespace(diagnostic.message),
+	]);
+}
+
+function uniqueFilePaths(diagnostics: UnifiedDiagnostic[]): string[] {
+	return Array.from(new Set(diagnostics.map((diagnostic) => diagnostic.filePath))).sort((left, right) => left.localeCompare(right));
+}
+
+function buildSummaryEntries(diagnostics: UnifiedDiagnostic[]): DiagnosticSummaryEntry[] {
+	const sorted = sortDiagnostics(diagnostics);
+	const buckets = new Map<string, UnifiedDiagnostic[]>();
+	for (const diagnostic of sorted) {
+		const key = diagnosticIssueKey(diagnostic);
+		const bucket = buckets.get(key) ?? [];
+		bucket.push(diagnostic);
+		buckets.set(key, bucket);
+	}
+
+	const emittedGroups = new Set<string>();
+	const entries: DiagnosticSummaryEntry[] = [];
+	for (const diagnostic of sorted) {
+		const key = diagnosticIssueKey(diagnostic);
+		const bucket = buckets.get(key) ?? [diagnostic];
+		const filePaths = uniqueFilePaths(bucket);
+		if (filePaths.length >= REPEATED_DIAGNOSTIC_MIN_FILES) {
+			if (emittedGroups.has(key)) continue;
+			emittedGroups.add(key);
+			entries.push({ kind: "group", representative: bucket[0] ?? diagnostic, diagnostics: bucket, filePaths });
+			continue;
+		}
+		entries.push({ kind: "single", diagnostic });
+	}
+	return entries;
+}
+
+function countDiagnosticsInEntries(entries: DiagnosticSummaryEntry[]): number {
+	return entries.reduce((count, entry) => count + (entry.kind === "group" ? entry.diagnostics.length : 1), 0);
+}
+
+function formatDiagnosticGroup(entry: Extract<DiagnosticSummaryEntry, { kind: "group" }>): string {
+	const code = entry.representative.code ? ` [${entry.representative.code}]` : "";
+	const occurrences =
+		entry.diagnostics.length === entry.filePaths.length
+			? `${entry.filePaths.length} files`
+			: `${entry.diagnostics.length} occurrences across ${entry.filePaths.length} files`;
+	const exampleFiles = entry.filePaths.slice(0, SUMMARY_EXAMPLE_FILE_LIMIT);
+	const moreExamples = entry.filePaths.length > SUMMARY_EXAMPLE_FILE_LIMIT ? `, … ${entry.filePaths.length - SUMMARY_EXAMPLE_FILE_LIMIT} more` : "";
+	const examples = exampleFiles.length > 0 ? ` (examples: ${exampleFiles.join(", ")}${moreExamples})` : "";
+	return `${entry.representative.severity.toUpperCase()}: repeated in ${occurrences}${code} ${clipText(
+		compactWhitespace(entry.representative.message),
+		220,
+	)}${examples}`;
+}
+
+function formatSummaryEntry(entry: DiagnosticSummaryEntry): string {
+	return entry.kind === "group" ? formatDiagnosticGroup(entry) : formatDiagnosticLine(entry.diagnostic);
+}
+
 function mergeDuplicates(diagnostics: UnifiedDiagnostic[]): UnifiedDiagnostic[] {
 	const merged = new Map<string, UnifiedDiagnostic>();
 	for (const diagnostic of diagnostics) {
@@ -147,21 +218,36 @@ export function formatDiagnosticLine(diagnostic: UnifiedDiagnostic): string {
 export function buildFileSummary(filePath: string, diagnostics: UnifiedDiagnostic[], maxItems = 8): string | null {
 	if (diagnostics.length === 0) return null;
 	const counts = formatCounts(countDiagnostics(diagnostics));
+	const entries = buildSummaryEntries(diagnostics);
 	const lines = [`Diagnostics for ${filePath}: ${counts}`];
-	for (const diagnostic of diagnostics.slice(0, maxItems)) lines.push(`- ${formatDiagnosticLine(diagnostic)}`);
-	if (diagnostics.length > maxItems) lines.push(`- … ${diagnostics.length - maxItems} more`);
+	for (const entry of entries.slice(0, maxItems)) lines.push(`- ${formatSummaryEntry(entry)}`);
+	const remainingCount = countDiagnosticsInEntries(entries.slice(maxItems));
+	if (remainingCount > 0) lines.push(`- … ${remainingCount} more`);
+	return lines.join("\n");
+}
+
+export function buildDiagnosticsUpdateSummary(diagnostics: UnifiedDiagnostic[], maxItems = 8): string | null {
+	if (diagnostics.length === 0) return null;
+	const counts = formatCounts(countDiagnostics(diagnostics));
+	const entries = buildSummaryEntries(diagnostics);
+	const lines = [`Current diagnostics for touched files: ${counts}.`];
+	for (const entry of entries.slice(0, maxItems)) lines.push(`- ${formatSummaryEntry(entry)}`);
+	const remainingCount = countDiagnosticsInEntries(entries.slice(maxItems));
+	if (remainingCount > 0) lines.push(`- … ${remainingCount} more diagnostics are available via the diagnostics tool.`);
 	return lines.join("\n");
 }
 
 export function buildPromptSummary(diagnostics: UnifiedDiagnostic[], maxItems = 8): string | null {
 	if (diagnostics.length === 0) return null;
 	const counts = formatCounts(countDiagnostics(diagnostics));
+	const entries = buildSummaryEntries(diagnostics);
 	const lines = [
 		"Background diagnostics snapshot:",
 		`Current merged diagnostics: ${counts}.`,
 		"Most relevant current issues:",
 	];
-	for (const diagnostic of diagnostics.slice(0, maxItems)) lines.push(`- ${formatDiagnosticLine(diagnostic)}`);
-	if (diagnostics.length > maxItems) lines.push(`- … ${diagnostics.length - maxItems} more diagnostics are available via the diagnostics tool.`);
+	for (const entry of entries.slice(0, maxItems)) lines.push(`- ${formatSummaryEntry(entry)}`);
+	const remainingCount = countDiagnosticsInEntries(entries.slice(maxItems));
+	if (remainingCount > 0) lines.push(`- … ${remainingCount} more diagnostics are available via the diagnostics tool.`);
 	return lines.join("\n");
 }
