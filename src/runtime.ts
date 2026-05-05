@@ -13,6 +13,7 @@ import type {
 	ProviderStatus,
 	StatusSymbolsMode,
 	TriggerReason,
+	WorkspaceInventory,
 } from "./types.js";
 import { findWorkspaceRoot, hashText, isPathInside, now, scanWorkspace, shouldIgnorePath, toRelative } from "./util.js";
 
@@ -214,7 +215,7 @@ export class WorkspaceBridge {
 	private readonly debugLogPath?: string;
 	private providers: ProviderRuntime[] = [];
 	private readonly listeners = new Set<() => void>();
-	private inventory = scanWorkspace(process.cwd());
+	private inventory: WorkspaceInventory = { files: [], basenames: new Set<string>(), extensions: new Set<string>(), packageJsonDeps: new Set<string>() };
 	private excludePaths: string[] = [];
 	private statusSymbols: StatusSymbolsMode = "nerdfont";
 	private idleTimer: NodeJS.Timeout | undefined;
@@ -239,6 +240,7 @@ export class WorkspaceBridge {
 
 	static create(cwd: string, options?: { sessionId?: string }): WorkspaceBridge {
 		const workspaceRoot = findWorkspaceRoot(cwd);
+		if (!workspaceRoot) throw new Error(`Cannot create pi-lsp-bridge outside a git repository: ${cwd}`);
 		const loaded = loadConfig(workspaceRoot);
 		const cleanupRegistry = new CleanupRegistry(workspaceRoot, loaded.lifecycle.orphanSweepMaxAgeMs);
 		const sessionLogger = createSessionLogger({ enabled: loaded.debug, sessionId: options?.sessionId, workspaceRoot });

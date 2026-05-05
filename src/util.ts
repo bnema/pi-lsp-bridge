@@ -61,7 +61,7 @@ export function toRelative(root: string, path: string): string {
 	return rel === "" ? "." : rel.split(sep).join("/");
 }
 
-export function findWorkspaceRoot(start: string): string {
+export function findWorkspaceRoot(start: string): string | null {
 	let current = resolve(start);
 	let previous = "";
 	while (current !== previous) {
@@ -69,7 +69,7 @@ export function findWorkspaceRoot(start: string): string {
 		previous = current;
 		current = dirname(current);
 	}
-	return resolve(start);
+	return null;
 }
 
 export function isPathInside(root: string, candidatePath: string): boolean {
