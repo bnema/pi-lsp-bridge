@@ -91,9 +91,11 @@ type StatusContext = {
 };
 type BridgeContext = StatusContext & { sessionManager: { getSessionId: () => string } };
 
+const INACTIVE_MESSAGE = "pi-lsp-bridge inactive: current directory is not inside a git repository.";
+
 function applyStatus(bridge: WorkspaceBridge | undefined, ctx: StatusContext): void {
-	if (!bridge || !ctx.hasUI) return;
-	ctx.ui.setStatus("pi-lsp-bridge", bridge.statusText());
+	if (!ctx.hasUI) return;
+	ctx.ui.setStatus("pi-lsp-bridge", bridge?.statusText());
 }
 
 export default function (pi: ExtensionAPI) {
@@ -121,39 +123,52 @@ export default function (pi: ExtensionAPI) {
 		applyStatus(current, ctx);
 	}
 
-	function ensureBridge(cwd: string, ctx?: BridgeContext): WorkspaceBridge {
+	async function clearBridge(reason: "idle" | "shutdown" | "reload", ctx?: StatusContext): Promise<void> {
+		const current = bridge;
+		unsubscribeStatus?.();
+		unsubscribeStatus = undefined;
+		bridge = undefined;
+		if (ctx) applyStatus(undefined, ctx);
+		if (current) await current.shutdown(reason);
+	}
+
+	async function ensureBridge(cwd: string, ctx?: BridgeContext): Promise<WorkspaceBridge | undefined> {
 		const workspaceRoot = findWorkspaceRoot(cwd);
+		if (!workspaceRoot) {
+			await clearBridge("reload", ctx);
+			return undefined;
+		}
 		if (!bridge || bridge.workspaceRoot !== workspaceRoot) {
-			unsubscribeStatus?.();
-			unsubscribeStatus = undefined;
+			await clearBridge("reload", ctx);
 			bridge = WorkspaceBridge.create(workspaceRoot, { sessionId: ctx?.sessionManager.getSessionId() });
 		}
 		if (ctx) bindStatus(bridge, ctx);
 		return bridge;
 	}
 
-	async function restartBridge(ctx: ExtensionCommandContext): Promise<void> {
-		if (bridge) await bridge.shutdown("reload");
-		unsubscribeStatus?.();
-		unsubscribeStatus = undefined;
-		bridge = WorkspaceBridge.create(findWorkspaceRoot(ctx.cwd), { sessionId: ctx.sessionManager.getSessionId() });
+	async function restartBridge(ctx: ExtensionCommandContext): Promise<WorkspaceBridge | undefined> {
+		await clearBridge("reload", ctx);
+		const workspaceRoot = findWorkspaceRoot(ctx.cwd);
+		if (!workspaceRoot) return undefined;
+		bridge = WorkspaceBridge.create(workspaceRoot, { sessionId: ctx.sessionManager.getSessionId() });
 		bridge.logDebug("index.restartBridge", { cwd: ctx.cwd });
 		bindStatus(bridge, ctx);
+		return bridge;
 	}
 
 	pi.registerCommand("lsp-status", {
 		description: "Show current background diagnostics bridge status",
 		handler: async (_args, ctx) => {
-			const current = ensureBridge(ctx.cwd, ctx);
-			ctx.ui.notify(current.statusText(), "info");
+			const current = await ensureBridge(ctx.cwd, ctx);
+			ctx.ui.notify(current?.statusText() ?? INACTIVE_MESSAGE, "info");
 		},
 	});
 
 	pi.registerCommand("lsp-restart", {
 		description: "Restart the background diagnostics bridge",
 		handler: async (_args, ctx) => {
-			await restartBridge(ctx);
-			ctx.ui.notify("pi-lsp-bridge restarted", "info");
+			const current = await restartBridge(ctx);
+			ctx.ui.notify(current ? "pi-lsp-bridge restarted" : INACTIVE_MESSAGE, "info");
 		},
 	});
 
@@ -171,12 +186,14 @@ export default function (pi: ExtensionAPI) {
 			maxItems: Type.Optional(Type.Number({ description: "Maximum diagnostics to show", minimum: 1, maximum: 100 })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const current = ensureBridge(ctx.cwd, ctx);
-			const text = current.diagnosticsText({
-				path: params.path,
-				providerId: params.providerId,
-				maxItems: params.maxItems,
-			});
+			const current = await ensureBridge(ctx.cwd, ctx);
+			const text = current
+				? current.diagnosticsText({
+					path: params.path,
+					providerId: params.providerId,
+					maxItems: params.maxItems,
+				})
+				: INACTIVE_MESSAGE;
 			applyStatus(current, ctx);
 			return {
 				content: [{ type: "text", text }],
@@ -186,13 +203,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		bridge = WorkspaceBridge.create(findWorkspaceRoot(ctx.cwd), { sessionId: ctx.sessionManager.getSessionId() });
-		bridge.logDebug("index.session_start", { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() });
-		bindStatus(bridge, ctx);
+		const current = await ensureBridge(ctx.cwd, ctx);
+		current?.logDebug("index.session_start", { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() });
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		const current = ensureBridge(ctx.cwd, ctx);
+		const current = await ensureBridge(ctx.cwd, ctx);
+		if (!current) return;
 		current.logDebug("index.before_agent_start", { cwd: ctx.cwd });
 		const summary = current.buildPromptContext();
 		if (!summary) return;
@@ -202,14 +219,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_call" as any, async (event: any, ctx: any) => {
-		const current = ensureBridge(ctx.cwd, ctx);
-		current.logDebug("index.tool_call", { toolName: event.toolName, cwd: ctx.cwd, input: event.input });
+		const current = await ensureBridge(ctx.cwd, ctx);
+		current?.logDebug("index.tool_call", { toolName: event.toolName, cwd: ctx.cwd, input: event.input });
 	});
 
 	pi.on("tool_result" as any, async (event: any, ctx: any) => {
 		if (!["read", "edit", "write", "bash"].includes(event.toolName)) return;
 		if (event.toolName !== "bash" && event.isError) return;
-		const current = ensureBridge(ctx.cwd, ctx);
+		const current = await ensureBridge(ctx.cwd, ctx);
+		if (!current) return;
 		const paths = extractToolPaths(event, ctx.cwd, current.workspaceRoot);
 		current.logDebug("index.tool_result", {
 			toolName: event.toolName,
