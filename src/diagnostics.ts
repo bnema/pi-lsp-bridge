@@ -30,6 +30,7 @@ function countDiagnostics(diagnostics: UnifiedDiagnostic[]): DiagnosticsCounts {
 }
 
 const REPEATED_DIAGNOSTIC_MIN_FILES = 2;
+const REPEATED_DIAGNOSTIC_MIN_OCCURRENCES = 3;
 const SUMMARY_EXAMPLE_FILE_LIMIT = 3;
 const PI_PEER_DEPENDENCY_HINT =
 	"Hint: Pi peer dependency not resolvable from workspace node_modules; run npm install or configure Pi SDK paths.";
@@ -156,7 +157,7 @@ function buildSummaryEntries(diagnostics: UnifiedDiagnostic[]): DiagnosticSummar
 		const key = diagnosticIssueKey(diagnostic);
 		const bucket = buckets.get(key) ?? [diagnostic];
 		const filePaths = uniqueFilePaths(bucket);
-		if (filePaths.length >= REPEATED_DIAGNOSTIC_MIN_FILES) {
+		if (filePaths.length >= REPEATED_DIAGNOSTIC_MIN_FILES || bucket.length >= REPEATED_DIAGNOSTIC_MIN_OCCURRENCES) {
 			if (emittedGroups.has(key)) continue;
 			emittedGroups.add(key);
 			entries.push({ kind: "group", representative: bucket[0] ?? diagnostic, diagnostics: bucket, filePaths });
@@ -182,20 +183,34 @@ function formatCountsWithCluster(diagnostics: UnifiedDiagnostic[]): string {
 	return `${counts} (${cluster.secondaryCount} secondary ${secondaryPlural} grouped under ${cluster.rootCount} module-resolution ${rootPlural})`;
 }
 
+function formatDiagnosticGroupOccurrences(entry: Extract<DiagnosticSummaryEntry, { kind: "group" }>): string {
+	if (entry.filePaths.length === 1) return `${entry.diagnostics.length} occurrences in ${entry.filePaths[0]}`;
+	if (entry.diagnostics.length === entry.filePaths.length) return `in ${entry.filePaths.length} files`;
+	return `${entry.diagnostics.length} occurrences across ${entry.filePaths.length} files`;
+}
+
+function formatDiagnosticGroupExamples(entry: Extract<DiagnosticSummaryEntry, { kind: "group" }>): string {
+	if (entry.filePaths.length !== 1) {
+		const exampleFiles = entry.filePaths.slice(0, SUMMARY_EXAMPLE_FILE_LIMIT);
+		const moreExamples = entry.filePaths.length > SUMMARY_EXAMPLE_FILE_LIMIT ? `, … ${entry.filePaths.length - SUMMARY_EXAMPLE_FILE_LIMIT} more` : "";
+		return exampleFiles.length > 0 ? ` (examples: ${exampleFiles.join(", ")}${moreExamples})` : "";
+	}
+
+	const uniqueLines = Array.from(new Set(entry.diagnostics.map((diagnostic) => diagnostic.range?.start.line).filter((line): line is number => line !== undefined))).sort(
+		(left, right) => left - right,
+	);
+	const exampleLines = uniqueLines.slice(0, SUMMARY_EXAMPLE_FILE_LIMIT).map((line) => line + 1);
+	const moreLines = uniqueLines.length > SUMMARY_EXAMPLE_FILE_LIMIT ? `, … ${uniqueLines.length - SUMMARY_EXAMPLE_FILE_LIMIT} more` : "";
+	return exampleLines.length > 0 ? ` (lines: ${exampleLines.join(", ")}${moreLines})` : "";
+}
+
 function formatDiagnosticGroup(entry: Extract<DiagnosticSummaryEntry, { kind: "group" }>): string {
 	const code = entry.representative.code ? ` [${entry.representative.code}]` : "";
-	const occurrences =
-		entry.diagnostics.length === entry.filePaths.length
-			? `${entry.filePaths.length} files`
-			: `${entry.diagnostics.length} occurrences across ${entry.filePaths.length} files`;
-	const exampleFiles = entry.filePaths.slice(0, SUMMARY_EXAMPLE_FILE_LIMIT);
-	const moreExamples = entry.filePaths.length > SUMMARY_EXAMPLE_FILE_LIMIT ? `, … ${entry.filePaths.length - SUMMARY_EXAMPLE_FILE_LIMIT} more` : "";
-	const examples = exampleFiles.length > 0 ? ` (examples: ${exampleFiles.join(", ")}${moreExamples})` : "";
 	const hint = isPiPeerDependencyRoot(entry.representative) ? ` ${PI_PEER_DEPENDENCY_HINT}` : "";
-	return `${entry.representative.severity.toUpperCase()}: repeated in ${occurrences}${code} ${clipText(
+	return `${entry.representative.severity.toUpperCase()}: repeated ${formatDiagnosticGroupOccurrences(entry)}${code} ${clipText(
 		compactWhitespace(entry.representative.message),
 		220,
-	)}${examples}${hint}`;
+	)}${formatDiagnosticGroupExamples(entry)}${hint}`;
 }
 
 function formatSecondaryDiagnostics(entry: Extract<DiagnosticSummaryEntry, { kind: "secondary" }>): string {
