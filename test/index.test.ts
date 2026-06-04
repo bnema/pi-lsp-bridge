@@ -30,5 +30,6 @@ test("buildSystemPromptWithDiagnosticsContext omits diagnostics-tool guidance wh
 test("buildSystemPromptWithDiagnosticsContext preserves guidance when selectedTools shape is unknown", () => {
 	const prompt = buildSystemPromptWithDiagnosticsContext(basePrompt, summary, { diagnostics: true });
 
+	assert.ok(prompt.includes(summary));
 	assert.ok(prompt.includes(guidance));
 });
