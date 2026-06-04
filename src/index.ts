@@ -71,6 +71,17 @@ function extractToolPaths(event: { toolName?: string; input?: unknown; content?:
 	return [normalized.startsWith("/") ? normalized : `${cwd}/${normalized}`];
 }
 
+export function shouldAppendDiagnosticsToolGuidance(selectedTools: unknown): boolean {
+	if (selectedTools === undefined || !Array.isArray(selectedTools)) return true;
+	return selectedTools.includes("diagnostics");
+}
+
+export function buildSystemPromptWithDiagnosticsContext(systemPrompt: string, summary: string, selectedTools: unknown): string {
+	const base = `${systemPrompt}\n\n${summary}`;
+	if (!shouldAppendDiagnosticsToolGuidance(selectedTools)) return base;
+	return `${base}\n\nUse the diagnostics tool if you need a fuller, current snapshot.`;
+}
+
 function surfaceDiagnosticsUpdate(pi: ExtensionAPI, summary: string): void {
 	pi.sendMessage(
 		{
@@ -214,7 +225,11 @@ export default function (pi: ExtensionAPI) {
 		const summary = current.buildPromptContext();
 		if (!summary) return;
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${summary}\n\nUse the diagnostics tool if you need a fuller, current snapshot.`,
+			systemPrompt: buildSystemPromptWithDiagnosticsContext(
+				event.systemPrompt,
+				summary,
+				event.systemPromptOptions?.selectedTools,
+			),
 		};
 	});
 
