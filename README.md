@@ -30,13 +30,32 @@ Fallback:
 pi-lsp-bridge.json
 ```
 
-## Use
+Config defines diagnostic providers, LSP commands, linter commands, file globs, cooldowns, and formatting rules. Repo config is preferred over extension defaults.
 
-Ask Pi to inspect diagnostics, or call the tool directly:
+## Commands
 
 ```text
-Show current diagnostics for this project.
+/lsp-status
+/lsp-restart
 ```
+
+## Tool
+
+Use the `diagnostics` tool to inspect current merged diagnostics:
+
+```json
+{
+  "path": "src/index.ts",
+  "providerId": "tsc",
+  "maxItems": 50
+}
+```
+
+All fields are optional. Without arguments, it returns bounded project diagnostics.
+
+## Runtime safety
+
+The bridge uses debounce, cooldown, idle suspend, and orphan cleanup to avoid background thrash. It supports LSP diagnostics and repo-configured CLI/linter providers.
 
 ## Develop
 
