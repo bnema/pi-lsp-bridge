@@ -1,9 +1,13 @@
 {
   "name": "pi-lsp-bridge",
   "version": "0.3.2",
-  "description": "Minimal, data-driven diagnostics bridge for pi using LSPs and repo-configured linters.",
+  "description": "Collect background diagnostics for Pi from LSPs and repo-configured linters.",
   "keywords": [
-    "pi-package"
+    "pi",
+    "pi-extension",
+    "lsp",
+    "diagnostics",
+    "linters"
   ],
   "type": "module",
   "private": true,
