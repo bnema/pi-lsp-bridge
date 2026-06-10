@@ -1,7 +1,7 @@
 import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { UnifiedDiagnostic } from "./types.js";
-import { isPathInside, shouldIgnorePath, stableDiagnosticId } from "./util.js";
+import { isGeneratedFile, isPathInside, shouldIgnorePath, stableDiagnosticId } from "./util.js";
 
 function severityFromNumber(value: number | undefined): UnifiedDiagnostic["severity"] {
 	if (value === 2) return "warning";
@@ -23,7 +23,7 @@ function normalizePath(workspaceRoot: string, filePath: string): string | null {
 	} catch {
 		return null;
 	}
-	if (!isPathInside(workspaceRoot, absolute) || shouldIgnorePath(workspaceRoot, absolute)) return null;
+	if (!isPathInside(workspaceRoot, absolute) || shouldIgnorePath(workspaceRoot, absolute) || isGeneratedFile(workspaceRoot, absolute)) return null;
 	const rel = relative(workspaceRoot, absolute).replace(/\\/g, "/");
 	return rel === "" ? "." : rel;
 }

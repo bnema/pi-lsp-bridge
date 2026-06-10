@@ -4,7 +4,7 @@ import { relative } from "node:path";
 import type { Logger } from "pino";
 import type { BridgeLifecycleConfig, ProviderRuntime, ProviderSpec, ProviderStatus, TriggerReason, UnifiedDiagnostic } from "./types.js";
 import { DiagnosticsStore } from "./diagnostics.js";
-import { chooseResolvedCommand, isLargeFile, isPathInside, now, shouldIgnorePath, stableDiagnosticId } from "./util.js";
+import { chooseResolvedCommand, isGeneratedFile, isLargeFile, isPathInside, now, shouldIgnorePath, stableDiagnosticId } from "./util.js";
 
 interface OpenDocument {
 	uri: string;
@@ -372,6 +372,16 @@ export class LspProvider implements ProviderRuntime {
 			}
 			if (!isPathInside(this.workspaceRoot, filePath) || shouldIgnorePath(this.workspaceRoot, filePath, this.excludePaths)) return;
 			const relativePath = relative(this.workspaceRoot, filePath).replace(/\\/g, "/") || filePath;
+			if (isGeneratedFile(this.workspaceRoot, filePath)) {
+				this.store.replaceProviderFiles(this.spec.id, new Map([[relativePath, []]]));
+				this.logger.debug({ filePath: relativePath }, "lsp diagnostics ignored for generated file");
+				this.onChange();
+				const waiters = this.waiters.get(filePath) ?? this.waiters.get(relativePath) ?? [];
+				for (const waiter of waiters) waiter();
+				this.waiters.delete(filePath);
+				this.waiters.delete(relativePath);
+				return;
+			}
 			const diagnostics = ((message.params?.diagnostics ?? []) as any[]).map((diagnostic) => ({
 				id: stableDiagnosticId([
 					this.spec.id,
